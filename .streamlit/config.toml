@@ -1,0 +1,12 @@
+# Pin a light theme so the app looks the same for everyone.
+# Without this, a viewer's OS dark mode flips Streamlit's text colours while
+# the app's own light cards stay light, which destroys contrast.
+[theme]
+base = "light"
+primaryColor = "#2d6ca8"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f4f7fb"
+textColor = "#1e293b"
+
+[server]
+maxUploadSize = 500
