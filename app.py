@@ -46,6 +46,7 @@ _IMPORT_NAME_OVERRIDES = {
     "pandas": "pandas",
     "openpyxl": "openpyxl",
     "xlsxwriter": "xlsxwriter",
+    "python-docx": "docx",
 }
 
 
@@ -341,6 +342,88 @@ def _build_relationships(bim: Dict[str, Any], vpa: Dict[str, Any]) -> pd.DataFra
     ])
 
 
+def _build_date_tables(bim_tables: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Flag tables marked as a date table, and their designated date column.
+
+    A .vpax carries model *metadata* only, not row data, so this can confirm
+    a table is marked `dataCategory: "Time"` and has a plausible date/key
+    column - it cannot verify the dates are actually contiguous.
+    """
+    rows = []
+    for t in bim_tables:
+        name = t.get("name")
+        if not name:
+            continue
+        is_time = str(t.get("dataCategory") or "").lower() == "time"
+        columns = [c for c in t.get("columns") or [] if isinstance(c, dict)]
+        key_cols = [c.get("name") for c in columns if c.get("isKey") and c.get("name")]
+        date_cols = [
+            c.get("name") for c in columns
+            if str(c.get("dataType") or "").lower() in ("datetime", "date") and c.get("name")
+        ]
+        if not is_time and not date_cols:
+            continue
+        rows.append({
+            "Table": name,
+            "Marked As Date Table": is_time,
+            "Key Column": ", ".join(key_cols),
+            "Date-Typed Columns": ", ".join(date_cols),
+        })
+    return _ensure_columns(pd.DataFrame(rows), [
+        "Table", "Marked As Date Table", "Key Column", "Date-Typed Columns",
+    ])
+
+
+def _build_roles(bim: Dict[str, Any], table_names: List[str]) -> pd.DataFrame:
+    """RLS roles and their per-table filter expressions.
+
+    `filterExpression` is DAX, so the same table-reference resolver used
+    everywhere else in this app (`find_referenced_tables`) tells us which
+    tables a role's filter actually touches.
+    """
+    rows = []
+    for role in (bim.get("model") or {}).get("roles") or []:
+        if not isinstance(role, dict):
+            continue
+        role_name = role.get("name") or ""
+        perms = [p for p in (role.get("tablePermissions") or []) if isinstance(p, dict)]
+        if not perms:
+            rows.append({"Role": role_name, "Table": "", "Filter Expression": "", "Tables Referenced": ""})
+            continue
+        for p in perms:
+            expr = p.get("filterExpression") or ""
+            referenced = find_referenced_tables(expr, table_names) if expr else set()
+            rows.append({
+                "Role": role_name,
+                "Table": p.get("name") or "",
+                "Filter Expression": expr,
+                "Tables Referenced": ", ".join(sorted(referenced)),
+            })
+    return _ensure_columns(pd.DataFrame(rows), ["Role", "Table", "Filter Expression", "Tables Referenced"])
+
+
+def _build_perspectives(bim: Dict[str, Any]) -> pd.DataFrame:
+    """Flatten perspectives into one row per (perspective, table, object)."""
+    rows = []
+    for persp in (bim.get("model") or {}).get("perspectives") or []:
+        if not isinstance(persp, dict):
+            continue
+        persp_name = persp.get("name") or ""
+        for pt in persp.get("perspectiveTables") or []:
+            if not isinstance(pt, dict):
+                continue
+            table_name = pt.get("name") or ""
+            cols = [c for c in (pt.get("perspectiveColumns") or []) if isinstance(c, dict) and c.get("name")]
+            meas = [m for m in (pt.get("perspectiveMeasures") or []) if isinstance(m, dict) and m.get("name")]
+            for c in cols:
+                rows.append({"Perspective": persp_name, "Table": table_name, "Object": c["name"], "Object Type": "Column"})
+            for m in meas:
+                rows.append({"Perspective": persp_name, "Table": table_name, "Object": m["name"], "Object Type": "Measure"})
+            if not cols and not meas:
+                rows.append({"Perspective": persp_name, "Table": table_name, "Object": "", "Object Type": "Table"})
+    return _ensure_columns(pd.DataFrame(rows), ["Perspective", "Table", "Object", "Object Type"])
+
+
 def extract_sql(m_expression: str) -> str:
     """Pull just the SQL out of a Power Query M expression.
 
@@ -509,22 +592,22 @@ def load_model(file_bytes: bytes) -> Dict[str, Any]:
             return pd.DataFrame()
         return pd.DataFrame([r for r in payload if isinstance(r, dict)])
 
-    # --- Tables (drop Description) ---
+    # --- Tables ---
+    # Description is kept (not dropped): health checks and the data
+    # dictionary export both need it, and show_table renders whatever
+    # columns are present, so there's no display-side reason to hide it.
     tables_df = _records("Tables")
-    if "Description" in tables_df.columns:
-        tables_df = tables_df.drop(columns=["Description"])
 
-    # --- Columns (drop DisplayFolder / Description / FormatString) ---
+    # --- Columns ---
+    # DisplayFolder/Description/FormatString are kept for the same reason.
     raw_columns = _records("Columns")
-    columns_df = raw_columns.drop(
-        columns=[c for c in ("DisplayFolder", "Description", "FormatString") if c in raw_columns.columns]
-    )
+    columns_df = raw_columns.copy()
 
     # --- Measures (keep only useful fields) ---
     measures_df = _records("Measures")
     if not measures_df.empty:
         measures_df = measures_df[
-            [c for c in ("TableName", "MeasureName", "MeasureExpression", "DataType", "FormatString")
+            [c for c in ("TableName", "MeasureName", "MeasureExpression", "DataType", "FormatString", "Description")
              if c in measures_df.columns]
         ]
     measures_df = _ensure_columns(measures_df, ["TableName", "MeasureName", "MeasureExpression"])
@@ -583,6 +666,8 @@ def load_model(file_bytes: bytes) -> Dict[str, Any]:
                 visible.append(cname)
         columns_by_table[tname] = visible
 
+    all_table_names = sorted({t["name"] for t in bim_tables if t.get("name")})
+
     return {
         "tables": tables_df,
         "columns": columns_df,
@@ -593,12 +678,116 @@ def load_model(file_bytes: bytes) -> Dict[str, Any]:
                                        ["TableName", "PartitionName", "Mode", "SQL"]),
         "screens": _build_screens(bim_tables),
         "page_like": _looks_page_organised(bim_tables),
-        "all_table_names": sorted({t["name"] for t in bim_tables if t.get("name")}),
+        "all_table_names": all_table_names,
         "columns_by_table": columns_by_table,
         "measure_names": measure_names,
         "column_tables": column_tables,
         "model_name": str(dax_model.get("ModelName") or ""),
+        "date_tables": _build_date_tables(bim_tables),
+        "roles": _build_roles(bim, all_table_names),
+        "perspectives": _build_perspectives(bim),
     }
+
+
+# ==========================================================================
+# VertiPaq / Model Size analysis
+# ==========================================================================
+# DAX Studio / Tabular Editor VertiPaq-Analyzer exports don't use one fixed
+# set of field names across tool versions, and no sample .vpax carrying
+# these stats is checked into this repo - so nothing here assumes a closed
+# schema. Every candidate name is checked for presence before use, and a
+# missing field simply means that sub-result is omitted, never an error.
+
+_VPA_SIZE_FIELD_CANDIDATES = (
+    "TotalSize", "TableSize", "DataSize", "DictionarySize", "ColumnSize",
+)
+_VPA_CARDINALITY_CANDIDATES = ("Cardinality", "ColumnCardinality")
+_VPA_ENCODING_CANDIDATES = ("Encoding", "ColumnEncoding")
+
+
+def detect_vpa_size_columns(df: pd.DataFrame) -> List[str]:
+    """Which VertiPaq-Analyzer stat fields actually exist on this frame."""
+    if df.empty:
+        return []
+    candidates = _VPA_SIZE_FIELD_CANDIDATES + _VPA_CARDINALITY_CANDIDATES + _VPA_ENCODING_CANDIDATES
+    return [c for c in candidates if c in df.columns]
+
+
+def _name_column(df: pd.DataFrame, *candidates: str) -> Optional[str]:
+    return next((c for c in candidates if c in df.columns), None)
+
+
+def build_model_size_summary(model: Dict[str, Any]) -> Dict[str, Any]:
+    """Aggregate whatever VertiPaq size/cardinality stats are present.
+
+    Degrades field-by-field: an export without VertiPaq stats (or one that
+    names them differently) yields fewer sub-results, never a broken table.
+    """
+    tables_df, columns_df = model["tables"], model["columns"]
+    summary: Dict[str, Any] = {"available": False}
+
+    table_name_col = _name_column(tables_df, "TableName", "Name")
+    table_size_col = _name_column(tables_df, *_VPA_SIZE_FIELD_CANDIDATES)
+    if table_name_col and table_size_col:
+        sized = tables_df[[table_name_col, table_size_col]].dropna(subset=[table_size_col])
+        if not sized.empty:
+            summary["available"] = True
+            summary["total_model_size"] = float(pd.to_numeric(sized[table_size_col], errors="coerce").sum())
+            summary["top_tables"] = (
+                sized.assign(**{table_size_col: pd.to_numeric(sized[table_size_col], errors="coerce")})
+                .sort_values(table_size_col, ascending=False)
+                .head(20)
+                .rename(columns={table_name_col: "Table", table_size_col: "Size"})
+                .reset_index(drop=True)
+            )
+
+    col_name_cols = [c for c in (_name_column(columns_df, "TableName"), _name_column(columns_df, "ColumnName")) if c]
+    col_size_col = _name_column(columns_df, *_VPA_SIZE_FIELD_CANDIDATES)
+    if col_name_cols and col_size_col:
+        sized = columns_df[col_name_cols + [col_size_col]].dropna(subset=[col_size_col])
+        if not sized.empty:
+            summary["available"] = True
+            summary["top_columns"] = (
+                sized.assign(**{col_size_col: pd.to_numeric(sized[col_size_col], errors="coerce")})
+                .sort_values(col_size_col, ascending=False)
+                .head(20)
+                .rename(columns={col_size_col: "Size"})
+                .reset_index(drop=True)
+            )
+
+    cardinality_col = _name_column(columns_df, *_VPA_CARDINALITY_CANDIDATES)
+    if col_name_cols and cardinality_col:
+        sized = columns_df[col_name_cols + [cardinality_col]].dropna(subset=[cardinality_col])
+        if not sized.empty:
+            summary["available"] = True
+            summary["top_cardinality"] = (
+                sized.assign(**{cardinality_col: pd.to_numeric(sized[cardinality_col], errors="coerce")})
+                .sort_values(cardinality_col, ascending=False)
+                .head(20)
+                .rename(columns={cardinality_col: "Cardinality"})
+                .reset_index(drop=True)
+            )
+
+    data_col = "DataSize" if "DataSize" in columns_df.columns else None
+    dict_col = "DictionarySize" if "DictionarySize" in columns_df.columns else None
+    if col_name_cols and data_col and dict_col:
+        breakdown = columns_df[col_name_cols + [data_col, dict_col]].dropna(subset=[data_col, dict_col], how="all")
+        if not breakdown.empty:
+            summary["available"] = True
+            summary["dict_vs_data"] = breakdown.rename(
+                columns={data_col: "Data Size", dict_col: "Dictionary Size"}
+            ).reset_index(drop=True)
+
+    encoding_col = _name_column(columns_df, *_VPA_ENCODING_CANDIDATES)
+    if encoding_col:
+        counts = columns_df[encoding_col].dropna()
+        if not counts.empty:
+            summary["available"] = True
+            vc = counts.value_counts().reset_index()
+            vc.columns = ["Encoding", "Column Count"]
+            summary["encoding_breakdown"] = vc
+
+    return summary
 
 
 # ==========================================================================
@@ -947,6 +1136,50 @@ def _same_dax(a: str, b: str) -> bool:
     def tokens(s: str) -> List[str]:
         return [t for k, t in _tokenize_dax(str(s or "")) if k not in ("ws", "comment")]
     return tokens(a) == tokens(b)
+
+
+def find_referenced_measures(expr: str, measure_names: Set[str]) -> Set[str]:
+    """Measure names a DAX expression calls, e.g. `[Total Sales] * 1.1`.
+
+    Mirrors the measure-vs-column distinction `optimize_dax` already makes
+    (a `[Ref]` token is a measure reference when its bare name is in
+    `measure_names`) - just collecting instead of rewriting.
+    """
+    if not expr:
+        return set()
+    found = set()
+    for kind, text in _tokenize_dax(expr):
+        if kind != "ref":
+            continue
+        name = text[1:-1]
+        if name in measure_names:
+            found.add(name)
+    return found
+
+
+def find_referenced_columns(
+    expr: str, column_tables: Dict[str, Set[str]], measure_names: Set[str]
+) -> Set[Tuple[str, str]]:
+    """(table, column) pairs a DAX expression unambiguously references.
+
+    A bare `[Ref]` token could be a column or a measure name; only tokens
+    that resolve to exactly one owning table are counted, since an
+    ambiguous name can't be attributed to a specific table without
+    inspecting how it's qualified at each use site.
+    """
+    if not expr:
+        return set()
+    found: Set[Tuple[str, str]] = set()
+    for kind, text in _tokenize_dax(expr):
+        if kind != "ref":
+            continue
+        name = text[1:-1]
+        if name in measure_names:
+            continue
+        owners = column_tables.get(name, set())
+        if len(owners) == 1:
+            found.add((next(iter(owners)), name))
+    return found
 
 
 @st.cache_data(show_spinner=False)
@@ -1448,6 +1681,353 @@ def fact_subject_areas(model: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 # ==========================================================================
+# Model analysis: unused objects, impact analysis, measure dependencies
+# ==========================================================================
+
+def referenced_columns(model: Dict[str, Any]) -> Set[Tuple[str, str]]:
+    """(table, column) pairs referenced by any measure, calc column, or relationship.
+
+    A static reference scan: it can't see Power BI report visuals (a .vpax
+    carries none) or RLS filter expressions - fold `model["roles"]`'s filter
+    expressions in too if those should also count as "used".
+    """
+    column_tables = model["column_tables"]
+    measure_names = model["measure_names"]
+    found: Set[Tuple[str, str]] = set()
+
+    for expr in model["measures"]["MeasureExpression"]:
+        found |= find_referenced_columns(str(expr or ""), column_tables, measure_names)
+    for expr in model["calc_columns"]["ColumnExpression"]:
+        found |= find_referenced_columns(str(expr or ""), column_tables, measure_names)
+
+    rel_df = model["relationships"]
+    for _, r in rel_df.iterrows():
+        if r["From Table"] and r["From Column"]:
+            found.add((r["From Table"], r["From Column"]))
+        if r["To Table"] and r["To Column"]:
+            found.add((r["To Table"], r["To Column"]))
+
+    return found
+
+
+def find_unused_columns(model: Dict[str, Any]) -> pd.DataFrame:
+    """Columns no measure, calculated column, or relationship references.
+
+    A column name shared by more than one table can't be attributed to a
+    specific table from an unqualified [Ref] alone, so those are reported as
+    ambiguous rather than silently marked used or unused.
+    """
+    columns_df = model["columns"]
+    if columns_df.empty or "TableName" not in columns_df.columns or "ColumnName" not in columns_df.columns:
+        return _ensure_columns(pd.DataFrame(), ["Table", "Column", "Status"])
+
+    used = referenced_columns(model)
+    used_names = {c for _, c in used}
+    column_tables = model["column_tables"]
+
+    rows = []
+    for _, row in columns_df[["TableName", "ColumnName"]].dropna().iterrows():
+        table, col = row["TableName"], row["ColumnName"]
+        if (table, col) in used:
+            # Confirmed for this exact table, e.g. via a relationship
+            # endpoint - never downgrade this to "ambiguous".
+            status = "Referenced"
+        elif len(column_tables.get(col, set())) > 1 and col in used_names:
+            status = "Referenced somewhere (table ambiguous)"
+        else:
+            status = "Likely unused"
+        rows.append({"Table": table, "Column": col, "Status": status})
+
+    return _ensure_columns(pd.DataFrame(rows), ["Table", "Column", "Status"])
+
+
+def impact_of(target_kind: str, target_name: str, model: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
+    """Everything that references a table or column, for pre-change review.
+
+    `target_kind` is "table" or "column". For "column", a DAX reference that
+    isn't table-qualified is matched by name only when it resolves
+    unambiguously - see `find_referenced_columns`.
+    """
+    measures_df, calc_df, rel_df = model["measures"], model["calc_columns"], model["relationships"]
+    table_names, column_tables, measure_names = model["all_table_names"], model["column_tables"], model["measure_names"]
+
+    def touches(expr: Any) -> bool:
+        expr = str(expr or "")
+        if not expr:
+            return False
+        if target_kind == "table":
+            return target_name in find_referenced_tables(expr, table_names)
+        return any(c == target_name for _, c in find_referenced_columns(expr, column_tables, measure_names))
+
+    measure_hits = measures_df[measures_df["MeasureExpression"].apply(touches)].reset_index(drop=True)
+    calc_hits = calc_df[calc_df["ColumnExpression"].apply(touches)].reset_index(drop=True)
+
+    if target_kind == "table":
+        rel_hits = rel_df[
+            (rel_df["From Table"] == target_name) | (rel_df["To Table"] == target_name)
+        ].reset_index(drop=True)
+        neighbours = sorted(_adjacency(rel_df).get(target_name, set()))
+    else:
+        rel_hits = rel_df[
+            (rel_df["From Column"] == target_name) | (rel_df["To Column"] == target_name)
+        ].reset_index(drop=True)
+        neighbours = []
+
+    related_df = pd.DataFrame({"Related Table": neighbours}) if neighbours else _ensure_columns(
+        pd.DataFrame(), ["Related Table"]
+    )
+
+    return {
+        "measures": measure_hits,
+        "calc_columns": calc_hits,
+        "relationships": rel_hits,
+        "related_tables": related_df,
+    }
+
+
+def build_measure_graph(model: Dict[str, Any]) -> Dict[str, Set[str]]:
+    """{measure name: {measures it calls}}, built from every measure's DAX."""
+    measure_names = model["measure_names"]
+    graph: Dict[str, Set[str]] = {name: set() for name in measure_names}
+    meas_df = model["measures"]
+    if "MeasureName" not in meas_df.columns:
+        return graph
+    for _, row in meas_df[["MeasureName", "MeasureExpression"]].dropna(subset=["MeasureName"]).iterrows():
+        name = row["MeasureName"]
+        calls = find_referenced_measures(str(row["MeasureExpression"] or ""), measure_names) - {name}
+        graph.setdefault(name, set())
+        graph[name] |= calls
+    return graph
+
+
+def find_cycles(graph: Dict[str, Set[str]]) -> List[List[str]]:
+    """Circular measure-reference chains, via DFS with a recursion stack.
+
+    A measure that (directly or transitively) calls itself can never
+    evaluate - always a modeling bug worth surfacing loudly.
+    """
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color: Dict[str, int] = {n: WHITE for n in graph}
+    stack: List[str] = []
+    cycles: List[List[str]] = []
+
+    def visit(node: str) -> None:
+        color[node] = GRAY
+        stack.append(node)
+        for nxt in graph.get(node, set()):
+            state = color.get(nxt, WHITE)
+            if state == WHITE:
+                visit(nxt)
+            elif state == GRAY:
+                idx = stack.index(nxt)
+                cycles.append(stack[idx:] + [nxt])
+        stack.pop()
+        color[node] = BLACK
+
+    for node in list(graph):
+        if color.get(node, WHITE) == WHITE:
+            visit(node)
+    return cycles
+
+
+def build_measure_dependency_dot(graph: Dict[str, Set[str]], focus: Optional[str] = None) -> str:
+    """DOT for a directed measure-calls-measure graph.
+
+    Same colour language as the ER diagrams (`#1f3a5f` primary / `#2d6ca8`
+    secondary / `#64748b` neutral) - just simple labeled nodes/edges, since
+    a measure graph has no crow's-foot cardinality to draw.
+    """
+    if focus:
+        keep = {focus} | graph.get(focus, set())
+        keep |= {n for n, calls in graph.items() if focus in calls}
+        nodes = keep
+        edges = [(a, b) for a, calls in graph.items() if a in keep for b in calls if b in keep]
+    else:
+        nodes = set(graph)
+        edges = [(a, b) for a, calls in graph.items() for b in calls]
+
+    cyclic_edges = set()
+    for cycle in find_cycles(graph):
+        for a, b in zip(cycle, cycle[1:]):
+            cyclic_edges.add((a, b))
+
+    lines = [
+        "digraph G {",
+        'rankdir="LR"; bgcolor="#ffffff";',
+        'node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, '
+        'fillcolor="#2d6ca8", fontcolor="#ffffff", color="#1f3a5f"];',
+        'edge [color="#64748b", fontname="Helvetica", fontsize=9];',
+    ]
+    for n in sorted(nodes):
+        fill = "#1f3a5f" if n == focus else "#2d6ca8"
+        lines.append(f"{_dot_id(n)} [label={_dot_id(n)}, fillcolor=\"{fill}\"];")
+    for a, b in edges:
+        colour = "#dc2626" if (a, b) in cyclic_edges else "#64748b"
+        lines.append(f"{_dot_id(a)} -> {_dot_id(b)} [color=\"{colour}\"];")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+# ==========================================================================
+# Model health checks + naming lint
+# ==========================================================================
+
+_ROW_CONTEXT_FUNCTIONS = (
+    "CALCULATE", "RELATED", "RELATEDTABLE", "EARLIER", "EARLIEST",
+    "FILTER", "ALL", "ALLEXCEPT", "USERELATIONSHIP",
+)
+
+
+def run_health_checks(model: Dict[str, Any]) -> pd.DataFrame:
+    """Rules-engine checklist: {Rule, Object, Severity, Message}.
+
+    Every rule only fires when the data it needs is actually present in
+    this model export - e.g. the cardinality rule is skipped (not guessed)
+    when no VertiPaq Cardinality field was captured.
+    """
+    rows: List[Dict[str, str]] = []
+
+    def add(rule: str, obj: str, severity: str, message: str) -> None:
+        rows.append({"Rule": rule, "Object": obj, "Severity": severity, "Message": message})
+
+    rel_df = model["relationships"]
+    for _, r in rel_df[rel_df["Cross Filter Direction"] == "Both"].iterrows():
+        add(
+            "Bi-directional relationship", f'{r["From Table"]} ↔ {r["To Table"]}', "Medium",
+            "Bi-directional filtering can cause ambiguous or double-counted results — confirm it's intentional.",
+        )
+
+    calc_df = model["calc_columns"]
+    for _, r in calc_df.iterrows():
+        expr = str(r.get("ColumnExpression") or "").upper()
+        if expr and not any(fn in expr for fn in _ROW_CONTEXT_FUNCTIONS):
+            add(
+                "Calculated column could move upstream", f'{r["TableName"]}[{r["ColumnName"]}]', "Low",
+                "No row-context/relationship functions detected — this may be cheaper to compute in Power Query/SQL.",
+            )
+
+    columns_df = model["columns"]
+    cardinality_col = _name_column(columns_df, *_VPA_CARDINALITY_CANDIDATES)
+    if cardinality_col and {"TableName", "ColumnName"}.issubset(columns_df.columns):
+        key_pairs = set()
+        for _, r in rel_df.iterrows():
+            key_pairs.add((r["From Table"], r["From Column"]))
+            key_pairs.add((r["To Table"], r["To Column"]))
+        card_lookup = columns_df.dropna(subset=["TableName", "ColumnName"]).set_index(["TableName", "ColumnName"])[cardinality_col]
+        for table, col in key_pairs:
+            if (table, col) not in card_lookup.index:
+                continue
+            val = card_lookup.loc[(table, col)]
+            if isinstance(val, pd.Series):
+                val = val.iloc[0]
+            val = pd.to_numeric(val, errors="coerce")
+            if pd.notna(val) and val > 1_000_000:
+                add(
+                    "High-cardinality relationship key", f"{table}[{col}]", "Medium",
+                    f"Cardinality ~{int(val):,} — large key columns increase model size and slow joins.",
+                )
+    else:
+        add(
+            "High-cardinality relationship key", "(model-wide)", "Info",
+            "Skipped — this .vpax export doesn't include a VertiPaq Cardinality field.",
+        )
+
+    tables_df = model["tables"]
+    table_name_col = _name_column(tables_df, "TableName", "Name")
+    if "Description" in tables_df.columns and table_name_col:
+        for _, r in tables_df.iterrows():
+            if not str(r.get("Description") or "").strip():
+                add("Missing description", str(r[table_name_col]), "Low", "Table has no description.")
+    if "Description" in columns_df.columns and {"TableName", "ColumnName"}.issubset(columns_df.columns):
+        for _, r in columns_df.iterrows():
+            if not str(r.get("Description") or "").strip():
+                add("Missing description", f'{r["TableName"]}[{r["ColumnName"]}]', "Low", "Column has no description.")
+    meas_df = model["measures"]
+    if "Description" in meas_df.columns and "MeasureName" in meas_df.columns:
+        for _, r in meas_df.iterrows():
+            if not str(r.get("Description") or "").strip():
+                add("Missing description", str(r["MeasureName"]), "Low", "Measure has no description.")
+
+    if {"FormatString", "DataType"}.issubset(meas_df.columns):
+        for dtype, grp in meas_df.dropna(subset=["DataType"]).groupby("DataType"):
+            fmt_values = grp["FormatString"].dropna().astype(str)
+            fmt_values = fmt_values[fmt_values.str.strip() != ""]
+            distinct = sorted(fmt_values.unique())
+            if len(distinct) > 1:
+                shown = ", ".join(distinct[:5]) + (" …" if len(distinct) > 5 else "")
+                add(
+                    "Inconsistent format strings", str(dtype), "Low",
+                    f"{len(distinct)} different format strings used for {dtype} measures: {shown}",
+                )
+
+    return _ensure_columns(pd.DataFrame(rows), ["Rule", "Object", "Severity", "Message"])
+
+
+_CASING_PATTERNS = [
+    ("snake_case", re.compile(r"^[a-z][a-z0-9]*(_[a-z0-9]+)+$")),
+    ("PascalCase", re.compile(r"^[A-Z][a-zA-Z0-9]*$")),
+    ("camelCase", re.compile(r"^[a-z][a-zA-Z0-9]*$")),
+    ("Title Case With Spaces", re.compile(r"^[A-Z][a-z0-9]*(\s[A-Za-z0-9]+)*$")),
+]
+
+
+def _detect_casing(name: str) -> str:
+    for label, pattern in _CASING_PATTERNS:
+        if pattern.fullmatch(name):
+            return label
+    return "Other/mixed"
+
+
+def lint_naming(model: Dict[str, Any]) -> pd.DataFrame:
+    """Flag inconsistent casing across measures, tables, and columns.
+
+    Pure string heuristics, no DAX parsing. A convention is only flagged as
+    inconsistent within its own group (e.g. a table's own columns) since
+    different tables in the same model often use different, internally
+    consistent conventions.
+    """
+    rows: List[Dict[str, str]] = []
+
+    def scan(obj_type: str, names_by_group: Dict[str, List[str]]) -> None:
+        for group, names in names_by_group.items():
+            if len(names) < 2:
+                continue
+            conventions = [_detect_casing(n) for n in names]
+            dominant = pd.Series(conventions).value_counts().index[0]
+            for name, conv in zip(names, conventions):
+                if conv != dominant:
+                    rows.append({
+                        "Object Type": obj_type, "Table": group, "Name": name,
+                        "Detected Convention": conv,
+                        "Suggestion": f"Most {obj_type.lower()}s on {group} use {dominant} — consider matching it.",
+                    })
+
+    tables_df = model["tables"]
+    table_name_col = _name_column(tables_df, "TableName", "Name")
+    if table_name_col:
+        names = tables_df[table_name_col].dropna().astype(str).tolist()
+        scan("Table", {"(model)": names})
+
+    meas_df = model["measures"]
+    if {"TableName", "MeasureName"}.issubset(meas_df.columns):
+        groups: Dict[str, List[str]] = {}
+        for _, r in meas_df.dropna(subset=["MeasureName"]).iterrows():
+            groups.setdefault(str(r["TableName"]), []).append(str(r["MeasureName"]))
+        scan("Measure", groups)
+
+    columns_df = model["columns"]
+    if {"TableName", "ColumnName"}.issubset(columns_df.columns):
+        groups = {}
+        for _, r in columns_df.dropna(subset=["ColumnName"]).iterrows():
+            groups.setdefault(str(r["TableName"]), []).append(str(r["ColumnName"]))
+        scan("Column", groups)
+
+    return _ensure_columns(
+        pd.DataFrame(rows), ["Object Type", "Table", "Name", "Detected Convention", "Suggestion"]
+    )
+
+
+# ==========================================================================
 # Rendering helpers
 # ==========================================================================
 
@@ -1492,6 +2072,77 @@ def _excel_engine() -> Optional[str]:
 
 
 EXCEL_ENGINE = _excel_engine()
+
+
+def _docx_available() -> bool:
+    try:
+        import docx  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+DOCX_AVAILABLE = _docx_available()
+
+
+def build_data_dictionary_docx(
+    model: Dict[str, Any],
+    health_df: pd.DataFrame,
+    naming_df: pd.DataFrame,
+    unused_df: pd.DataFrame,
+) -> bytes:
+    """One-click data dictionary: model structure plus health/naming/unused findings.
+
+    Diagrams aren't embedded - the app's ER and measure-dependency diagrams
+    are rendered entirely client-side (viz.js in the browser), and there's
+    no server-side Graphviz rendering path to reuse here. Text/tables only;
+    embedding diagrams would need a separate server-side render step.
+    """
+    import docx
+
+    doc = docx.Document()
+    doc.add_heading(model.get("model_name") or "Data Dictionary", level=0)
+    doc.add_paragraph("Generated by VPAX Semantic Model Explorer.")
+
+    def add_section(title: str, df: pd.DataFrame, max_rows: int = 500) -> None:
+        doc.add_heading(title, level=1)
+        if df.empty:
+            doc.add_paragraph("None found.")
+            return
+        view = df.head(max_rows)
+        table = doc.add_table(rows=1, cols=len(view.columns))
+        table.style = "Light Grid Accent 1"
+        for i, col in enumerate(view.columns):
+            table.rows[0].cells[i].text = str(col)
+        for _, row in view.iterrows():
+            cells = table.add_row().cells
+            for i, col in enumerate(view.columns):
+                cells[i].text = _stringify_cell(row[col])
+        if len(df) > max_rows:
+            doc.add_paragraph(
+                f"… {len(df) - max_rows} more rows omitted for brevity; "
+                "see the tab's CSV/Excel export for the full list."
+            )
+
+    add_section("Tables", model["tables"])
+    add_section("Columns", model["columns"])
+    add_section("Measures", model["measures"])
+    add_section("Calculated Columns", model["calc_columns"])
+    add_section("Relationships", model["relationships"])
+    add_section("Power Query (SQL)", model["power_query"])
+    if not model["roles"].empty:
+        add_section("Security Roles (RLS)", model["roles"])
+    if not model["perspectives"].empty:
+        add_section("Perspectives", model["perspectives"])
+    if not model["date_tables"].empty:
+        add_section("Date Tables", model["date_tables"])
+    add_section("Model Health Findings", health_df)
+    add_section("Naming Convention Findings", naming_df)
+    add_section("Unused Column Candidates", unused_df)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
 
 
 def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
@@ -1625,7 +2276,7 @@ def tab_guard(tab_name: str):
     """Keep one failing tab from taking down the whole app.
 
     Every tab renders independently, so an unexpected shape in one part of a
-    model should degrade that tab only - the other seven still work, and the
+    model should degrade that tab only - the other tabs still work, and the
     error is reported in place with enough detail to act on.
     """
     try:
@@ -1644,6 +2295,9 @@ tabs = st.tabs([
     "🖥️ Dashboard Screens", "🌐 Semantic Model by Screen", "🗂️ Tables",
     "🧱 Columns / Schema", "📐 Measures", "🧮 Calculated Columns",
     "🔗 Relationships", "🛢️ Power Query (SQL)",
+    "📦 Model Size", "🧹 Unused Objects", "🔎 Impact Analysis",
+    "📊 Measure Dependencies", "✅ Model Health", "🔤 Naming Conventions",
+    "📅 Date Table Check", "🔐 Security & Perspectives", "📄 Data Dictionary Export",
 ])
 
 # --- Dashboard Screens ----------------------------------------------------
@@ -2083,6 +2737,192 @@ with tabs[7]:
                     file_name=f"{_slug(choice, 'query')}.sql",
                     mime="text/plain", key="dl_sql", disabled=not sql,
                 )
+
+# --- Model Size (VertiPaq) -------------------------------------------------
+with tabs[8]:
+    with tab_guard('Model Size'):
+        st.subheader("Model size & VertiPaq statistics")
+        st.caption(
+            "Surfaces whatever VertiPaq-Analyzer size/cardinality stats this .vpax export "
+            "captured. Field names vary by export tool/version, so this only shows what's "
+            "actually present — nothing here is guessed."
+        )
+        size_summary = build_model_size_summary(model)
+        if not size_summary.get("available"):
+            st.info(
+                "This .vpax export doesn't include VertiPaq size/cardinality statistics. "
+                "Re-export with a tool that captures them (e.g. DAX Studio's Advanced ➜ Export "
+                "Metadata, or Tabular Editor's Vertipaq Analyzer)."
+            )
+        else:
+            if "total_model_size" in size_summary:
+                st.metric("Total model size (sum of table sizes)", f'{size_summary["total_model_size"]:,.0f}')
+            if "top_tables" in size_summary:
+                st.markdown("**Top tables by size**")
+                show_table(size_summary["top_tables"], "Top Tables By Size", height=320, key="vpa_tables")
+            if "top_columns" in size_summary:
+                st.markdown("**Top columns by size**")
+                show_table(size_summary["top_columns"], "Top Columns By Size", height=320, key="vpa_columns")
+            if "top_cardinality" in size_summary:
+                st.markdown("**Highest-cardinality columns**")
+                show_table(size_summary["top_cardinality"], "Top Cardinality Columns", height=320, key="vpa_cardinality")
+            if "dict_vs_data" in size_summary:
+                st.markdown("**Dictionary vs. data size**")
+                show_table(size_summary["dict_vs_data"], "Dictionary Vs Data Size", height=320, key="vpa_dict")
+            if "encoding_breakdown" in size_summary:
+                st.markdown("**Encoding breakdown**")
+                show_table(size_summary["encoding_breakdown"], "Encoding Breakdown", height=220, key="vpa_encoding")
+
+# --- Unused Objects ---------------------------------------------------------
+with tabs[9]:
+    with tab_guard('Unused Objects'):
+        st.subheader("Columns not referenced by any measure, calculated column, or relationship")
+        st.caption(
+            "A static DAX reference scan — it can't see Power BI report visuals (a .vpax carries "
+            "none) or RLS filter expressions. Treat 'Likely unused' as a starting point for "
+            "review, not a guarantee it's safe to delete."
+        )
+        unused_df = find_unused_columns(model)
+        if unused_df.empty:
+            st.info("No column metadata available to check.")
+        else:
+            likely_unused = int((unused_df["Status"] == "Likely unused").sum())
+            c1, c2 = st.columns(2)
+            c1.metric("Likely unused columns", likely_unused)
+            c2.metric("Total columns", len(unused_df))
+            show_table(unused_df, "Unused Columns", height=460, key="unused")
+
+# --- Impact Analysis ---------------------------------------------------------
+with tabs[10]:
+    with tab_guard('Impact Analysis'):
+        st.subheader("What references this table or column?")
+        st.caption(
+            "Pick a table or column to see every measure, calculated column, and relationship "
+            "that touches it before you rename or delete it."
+        )
+        target_kind = st.radio("Look up a", ["Table", "Column"], horizontal=True, key="impact_kind")
+        options = model["all_table_names"] if target_kind == "Table" else sorted(model["column_tables"].keys())
+        if not options:
+            st.info("No tables/columns found in this model.")
+        else:
+            target_name = st.selectbox(f"Choose a {target_kind.lower()}", options, key="impact_target")
+            result = impact_of(target_kind.lower(), target_name, model)
+            st.markdown(f"**Measures referencing `{target_name}`** ({len(result['measures'])})")
+            show_table(result["measures"].reset_index(drop=True), f"{target_name} measures", height=260, key="impact_measures")
+            st.markdown(f"**Calculated columns referencing `{target_name}`** ({len(result['calc_columns'])})")
+            show_table(result["calc_columns"].reset_index(drop=True), f"{target_name} calc columns", height=220, key="impact_calc")
+            st.markdown(f"**Relationships involving `{target_name}`** ({len(result['relationships'])})")
+            show_table(result["relationships"].reset_index(drop=True), f"{target_name} relationships", height=220, key="impact_rels")
+            if target_kind == "Table" and not result["related_tables"].empty:
+                st.markdown("**Directly related tables**")
+                show_table(result["related_tables"], f"{target_name} related tables", height=180, key="impact_related")
+
+# --- Measure Dependencies ----------------------------------------------------
+with tabs[11]:
+    with tab_guard('Measure Dependencies'):
+        st.subheader("Which measures call other measures")
+        graph = build_measure_graph(model)
+        if not graph or not any(graph.values()):
+            st.info("No measure-to-measure references found in this model.")
+        else:
+            cycles = find_cycles(graph)
+            if cycles:
+                st.warning(
+                    f"⚠️ {len(cycles)} circular measure reference(s) found — these can never "
+                    "fully evaluate: " + "; ".join(" → ".join(c) for c in cycles[:5])
+                )
+            participating = sorted({n for n, calls in graph.items() if calls} | {c for calls in graph.values() for c in calls})
+            focus_options = ["(whole graph)"] + participating
+            choice = st.selectbox("Focus on a measure (optional)", focus_options, key="measure_graph_focus")
+            focus = None if choice.startswith("(whole") else choice
+            dot = build_measure_dependency_dot(graph, focus=focus)
+            static_diagram_panel(dot, engine="dot", filename="measure_dependencies")
+
+# --- Model Health -------------------------------------------------------------
+with tabs[12]:
+    with tab_guard('Model Health'):
+        st.subheader("Model health & best-practice checks")
+        health_df = run_health_checks(model)
+        if health_df.empty:
+            st.info("No health-check findings for this model.")
+        else:
+            counts = health_df["Severity"].value_counts()
+            c1, c2, c3 = st.columns(3)
+            c1.metric("High", int(counts.get("High", 0)))
+            c2.metric("Medium", int(counts.get("Medium", 0)))
+            c3.metric("Low", int(counts.get("Low", 0)))
+            show_table(health_df, "Model Health", height=460, key="health")
+
+# --- Naming Conventions -------------------------------------------------------
+with tabs[13]:
+    with tab_guard('Naming Conventions'):
+        st.subheader("Naming convention consistency")
+        naming_df = lint_naming(model)
+        if naming_df.empty:
+            st.info("No inconsistent naming detected.")
+        else:
+            st.caption(f"{len(naming_df)} object(s) don't match the dominant naming convention in their group.")
+            show_table(naming_df, "Naming Conventions", height=460, key="naming")
+
+# --- Date Table Check ---------------------------------------------------------
+with tabs[14]:
+    with tab_guard('Date Table Check'):
+        st.subheader("Date table / time-intelligence check")
+        st.info(
+            "A .vpax carries model **metadata only**, not row data — this check can confirm a "
+            "table is *marked* as a date table and has a plausible date column, but it "
+            "**cannot** verify the dates are actually contiguous (no gaps) without the real data."
+        )
+        date_df = model["date_tables"]
+        if date_df.empty:
+            st.warning("No table is marked `dataCategory: Time`, and no table has a date-typed column.")
+        else:
+            show_table(date_df, "Date Tables", height=320, key="date_tables")
+
+# --- Security & Perspectives ---------------------------------------------------
+with tabs[15]:
+    with tab_guard('Security & Perspectives'):
+        st.subheader("Row-level security roles & perspectives")
+        sub = st.tabs(["Roles (RLS)", "Perspectives"])
+        with sub[0]:
+            roles_df = model["roles"]
+            if roles_df.empty:
+                st.info("No RLS roles defined in this model.")
+            else:
+                show_table(roles_df, "Roles", height=380, key="roles")
+        with sub[1]:
+            persp_df = model["perspectives"]
+            if persp_df.empty:
+                st.info("No perspectives defined in this model.")
+            else:
+                show_table(persp_df, "Perspectives", height=380, key="perspectives")
+
+# --- Data Dictionary Export -----------------------------------------------------
+with tabs[16]:
+    with tab_guard('Data Dictionary Export'):
+        st.subheader("Auto-generated data dictionary")
+        st.caption(
+            "One .docx covering tables, columns, measures, calculated columns, relationships, "
+            "Power Query SQL, security/perspectives, and this app's health/naming/unused-object "
+            "findings. Diagrams aren't embedded — the ER and measure-dependency diagrams render "
+            "client-side only; download them separately from their own tabs."
+        )
+        if not DOCX_AVAILABLE:
+            st.button(
+                "⬇ Download Data Dictionary (.docx)", disabled=True, width="stretch",
+                help="Needs python-docx — run: pip install python-docx",
+            )
+        else:
+            dd_health_df = run_health_checks(model)
+            dd_naming_df = lint_naming(model)
+            dd_unused_df = find_unused_columns(model)
+            docx_bytes = build_data_dictionary_docx(model, dd_health_df, dd_naming_df, dd_unused_df)
+            st.download_button(
+                "⬇ Download Data Dictionary (.docx)", docx_bytes,
+                file_name=f"{_slug(model.get('model_name') or 'model')}_data_dictionary.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                key="dl_data_dictionary", width="stretch",
+            )
 
 st.markdown(
     f'<div class="app-footer">🧩 VPAX Semantic Model Explorer &nbsp;·&nbsp; <b>{AUTHOR}</b></div>',
