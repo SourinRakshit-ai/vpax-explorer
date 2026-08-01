@@ -1,3 +1,6 @@
 streamlit
 pandas
 openpyxl
+# Optional but recommended: gives the Source Lineage view a real SQL parser
+# instead of the FROM/JOIN regex fallback (correctly skips CTEs and subqueries).
+sqlglot
