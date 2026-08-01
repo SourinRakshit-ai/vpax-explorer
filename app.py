@@ -2582,16 +2582,20 @@ _ROW_CONTEXT_FUNCTIONS = (
 
 
 def run_health_checks(model: Dict[str, Any]) -> pd.DataFrame:
-    """Rules-engine checklist: {Rule, Object, Severity, Message}.
+    """Rules-engine checklist: {Rule, Object, Severity, Message, How to Fix}.
 
     Every rule only fires when the data it needs is actually present in
     this model export - e.g. the cardinality rule is skipped (not guessed)
-    when no VertiPaq Cardinality field was captured.
+    when no VertiPaq Cardinality field was captured. `Object` is the where
+    (the exact table/column/measure); `Message` is the what-and-why;
+    `How to Fix` is the concrete action - kept as three separate columns so
+    none of the three gets lost inside a wall of prose.
     """
     rows: List[Dict[str, str]] = []
 
-    def add(rule: str, obj: str, severity: str, message: str) -> None:
-        rows.append({"Rule": rule, "Object": obj, "Severity": severity, "Message": message})
+    def add(rule: str, obj: str, severity: str, message: str, fix: str) -> None:
+        rows.append({"Rule": rule, "Object": obj, "Severity": severity,
+                     "Message": message, "How to Fix": fix})
 
     meas_df_all = model["measures"]
     if "MeasureName" in meas_df_all.columns:
@@ -2602,6 +2606,9 @@ def run_health_checks(model: Dict[str, Any]) -> pd.DataFrame:
                 "Another measure elsewhere in the model shares this exact name — likely "
                 "copy-pasted logic under an identical name instead of reused, and confusing "
                 "for anyone trying to report against it.",
+                "Check Investigate ➜ Impact Analysis on this name first to see what each copy "
+                "actually feeds, then rename or delete the redundant one and repoint anything "
+                "that referenced it.",
             )
 
     measure_graph = build_measure_graph(model)
@@ -2610,6 +2617,9 @@ def run_health_checks(model: Dict[str, Any]) -> pd.DataFrame:
             "Circular measure reference", " → ".join(cycle), "High",
             "These measures call each other in a loop and can never fully evaluate — this is a "
             "correctness bug, not a style preference.",
+            "Open each measure in this chain (Explore ➜ Measures) and rewrite one of them so it "
+            "no longer calls a measure that, directly or through others, calls it back — usually "
+            "by inlining that dependency's logic or basing it on a shared base measure instead.",
         )
 
     rel_df = model["relationships"]
@@ -2617,6 +2627,10 @@ def run_health_checks(model: Dict[str, Any]) -> pd.DataFrame:
         add(
             "Bi-directional relationship", f'{r["From Table"]} ↔ {r["To Table"]}', "Medium",
             "Bi-directional filtering can cause ambiguous or double-counted results — confirm it's intentional.",
+            "In Power BI Desktop: Model view ➜ select the relationship ➜ set Cross filter "
+            "direction to Single, unless a specific measure genuinely needs the reverse filter — "
+            "in which case use CROSSFILTER() inside just that measure instead of leaving the "
+            "relationship bi-directional for the whole model.",
         )
 
     calc_df = model["calc_columns"]
@@ -2626,6 +2640,9 @@ def run_health_checks(model: Dict[str, Any]) -> pd.DataFrame:
             add(
                 "Calculated column could move upstream", f'{r["TableName"]}[{r["ColumnName"]}]', "Low",
                 "No row-context/relationship functions detected — this may be cheaper to compute in Power Query/SQL.",
+                "Recreate the same logic as a Power Query step (Add Column) or in the source SQL "
+                "view, then delete the calculated column — moving it upstream computes it once at "
+                "refresh instead of once per row at query time.",
             )
 
     columns_df = _user_facing_columns(model["columns"])
@@ -2647,11 +2664,16 @@ def run_health_checks(model: Dict[str, Any]) -> pd.DataFrame:
                 add(
                     "High-cardinality relationship key", f"{table}[{col}]", "High",
                     f"Cardinality ~{int(val):,} — large key columns increase model size and slow joins.",
+                    "Replace the natural key with a smaller surrogate integer key generated at "
+                    "load time, or split it (e.g. date/time apart) so each relationship side has "
+                    "fewer distinct values — see Audit ➜ Compression Advisor for the same column.",
                 )
     else:
         add(
             "High-cardinality relationship key", "(model-wide)", "Info",
             "Skipped — this .vpax export doesn't include a VertiPaq Cardinality field.",
+            "Re-export with a tool that captures VertiPaq stats (DAX Studio's Advanced ➜ Export "
+            "Metadata) to get this check.",
         )
 
     tables_df = model["tables"]
@@ -2659,16 +2681,23 @@ def run_health_checks(model: Dict[str, Any]) -> pd.DataFrame:
     if "Description" in tables_df.columns and table_name_col:
         for _, r in tables_df.iterrows():
             if not str(r.get("Description") or "").strip():
-                add("Missing description", str(r[table_name_col]), "Low", "Table has no description.")
+                add("Missing description", str(r[table_name_col]), "Low", "Table has no description.",
+                    "Tabular Editor: select the table ➜ Properties pane ➜ Description. In Power "
+                    "BI Desktop: Model view ➜ select the table ➜ Properties ➜ Description.")
     if "Description" in columns_df.columns and {"TableName", "ColumnName"}.issubset(columns_df.columns):
         for _, r in columns_df.iterrows():
             if not str(r.get("Description") or "").strip():
-                add("Missing description", f'{r["TableName"]}[{r["ColumnName"]}]', "Low", "Column has no description.")
+                add("Missing description", f'{r["TableName"]}[{r["ColumnName"]}]', "Low", "Column has no description.",
+                    "Tabular Editor: select the column ➜ Properties pane ➜ Description. In Power "
+                    "BI Desktop: Model view ➜ select the column ➜ Properties ➜ Description.")
     meas_df = model["measures"]
     if "Description" in meas_df.columns and "MeasureName" in meas_df.columns:
         for _, r in meas_df.iterrows():
             if not str(r.get("Description") or "").strip():
-                add("Missing description", str(r["MeasureName"]), "Low", "Measure has no description.")
+                add("Missing description", str(r["MeasureName"]), "Low", "Measure has no description.",
+                    "Tabular Editor: select the measure ➜ Properties pane ➜ Description. In Power "
+                    "BI Desktop: Model view ➜ select the measure ➜ Properties ➜ Description. "
+                    "Govern ➜ Fix Script (C#) can generate placeholder stubs for all of these.")
 
     if {"FormatString", "DataType"}.issubset(meas_df.columns):
         for dtype, grp in meas_df.dropna(subset=["DataType"]).groupby("DataType"):
@@ -2680,9 +2709,15 @@ def run_health_checks(model: Dict[str, Any]) -> pd.DataFrame:
                 add(
                     "Inconsistent format strings", str(dtype), "Low",
                     f"{len(distinct)} different format strings used for {dtype} measures: {shown}",
+                    "Pick one FormatString for this data type and apply it to every measure of "
+                    "that type — in Tabular Editor, multi-select the measures and set Format "
+                    "String once; in Power BI Desktop, select each measure under Measure Tools "
+                    "➜ Formatting.",
                 )
 
-    return _ensure_columns(pd.DataFrame(rows), ["Rule", "Object", "Severity", "Message"])
+    return _ensure_columns(
+        pd.DataFrame(rows), ["Rule", "Object", "Severity", "Message", "How to Fix"]
+    )
 
 
 _CASING_PATTERNS = [
@@ -2853,7 +2888,7 @@ def build_encoding_advice(model: Dict[str, Any]) -> pd.DataFrame:
     """
     cols = _user_facing_columns(model["columns"])
     schema = ["Table", "Column", "Encoding", "Compression", "Total Size (MB)",
-              "Dictionary %", "Max Distinct (est.)", "Severity", "Recommendation"]
+              "Dictionary %", "Max Distinct (est.)", "Severity", "Why", "How to Fix"]
     if cols.empty or "TotalSize" not in cols.columns:
         return _ensure_columns(pd.DataFrame(), schema)
 
@@ -2903,12 +2938,14 @@ def build_encoding_advice(model: Dict[str, Any]) -> pd.DataFrame:
         hidden = bool(c.get("IsHidden"))
         in_mdx = bool(c.get("IsAvailableInMDX"))
 
-        advice: List[str] = []
+        whys: List[str] = []
+        hows: List[str] = []
         severities: List[str] = []
 
-        def flag(sev: str, text: str) -> None:
+        def flag(sev: str, why: str, how: str) -> None:
             severities.append(sev)
-            advice.append(text)
+            whys.append(why)
+            hows.append(how)
 
         # "Big" here means big relative to this model, so the advisor stays
         # useful on a 20 MB model and doesn't drown you on a 20 GB one.
@@ -2918,35 +2955,41 @@ def build_encoding_advice(model: Dict[str, Any]) -> pd.DataFrame:
         if encoding == "HASH" and numeric:
             flag(
                 "High" if dict_pct > 40 else "Medium",
-                "Numeric column stored with HASH encoding — it carries a dictionary it "
-                "doesn't need. Set `EncodingHint = Value` in Tabular Editor (or clean the "
-                "column to a true integer type) to drop the dictionary entirely.",
+                "Numeric column stored with HASH encoding — it carries a dictionary it doesn't need.",
+                "Tabular Editor: select the column ➜ set `EncodingHint = Value` (or clean the "
+                "source so the column is a true integer type) — this drops the dictionary entirely.",
             )
 
         if compression.upper() == "NOSPLIT" and est_distinct and est_distinct <= 1024:
             flag(
                 "High" if very_big else "Medium",
                 f"At most ~{est_distinct:,} distinct values but segments are NOSPLIT, so "
-                "run-length encoding isn't kicking in. Sort the source query by this column "
-                "during load — RLE then collapses the long repeated runs.",
+                "run-length encoding isn't kicking in.",
+                "Add an ORDER BY on this column to the source query (or `Table.Sort` in Power "
+                "Query M) — sorting by the lowest-cardinality column first lets RLE collapse the "
+                "long repeated runs.",
             )
 
         if dict_pct > 60:
             flag(
                 "High" if very_big else "Medium",
                 f"The dictionary is {dict_pct:.0f}% of this column's footprint — classic "
-                "high-cardinality text or high-precision decimal. Split it (e.g. date from "
-                "time, prefix from suffix) or round the decimal to the precision you report on.",
+                "high-cardinality text or high-precision decimal.",
+                "Split the column (e.g. date apart from time, prefix apart from suffix) or round "
+                "the decimal to the precision actually reported on, either upstream in Power "
+                "Query/SQL or as a replacement calculated column.",
             )
 
         if hidden and in_mdx:
             flag(
                 "Medium",
                 "Hidden but still `IsAvailableInMDX = true`, so VertiPaq builds an attribute "
-                "hierarchy no report can use. Setting it to false reclaims that memory.",
+                "hierarchy no report can use.",
+                "Tabular Editor: select the column ➜ set `IsAvailableInMdx = false` — or generate "
+                "this automatically from Govern ➜ Fix Script (C#).",
             )
 
-        if not advice:
+        if not whys:
             continue
         severity = min(severities, key=lambda s: SEVERITY_ORDER.get(s, 9))
         rows.append({
@@ -2957,7 +3000,8 @@ def build_encoding_advice(model: Dict[str, Any]) -> pd.DataFrame:
             "Dictionary %": round(dict_pct, 1),
             "Max Distinct (est.)": est_distinct if est_distinct else "—",
             "Severity": severity,
-            "Recommendation": " ".join(advice),
+            "Why": " ".join(whys),
+            "How to Fix": " ".join(hows),
         })
 
     df = _ensure_columns(pd.DataFrame(rows), schema)
@@ -3150,6 +3194,9 @@ def build_taxonomy(model: Dict[str, Any]) -> Tuple[Dict[str, Any], pd.DataFrame]
                 "Why it matters": f"{len(loose)} measure(s) sit at the root while "
                                   f"{measures_in_folders} are filed in folders — report "
                                   "authors will scroll past them.",
+                "How to Fix": "Tabular Editor: multi-select these measures ➜ set Display Folder "
+                              "to match the table's existing folders. In Power BI Desktop: "
+                              "Model view ➜ select each measure ➜ Properties ➜ Display Folder.",
             })
 
     # Visible foreign keys: the single most common cause of a report author
@@ -3174,10 +3221,14 @@ def build_taxonomy(model: Dict[str, Any]) -> Tuple[Dict[str, Any], pd.DataFrame]
                 "Severity": "Medium",
                 "Why it matters": "Join keys aren't meaningful to report authors and "
                                   "summing or grouping by one produces nonsense. Hide them.",
+                "How to Fix": "Tabular Editor: select the column(s) ➜ set IsHidden = true. In "
+                              "Power BI Desktop: right-click the column in the Fields pane ➜ "
+                              "Hide in report view. Govern ➜ Fix Script (C#) generates this too.",
             })
 
     issues_df = _ensure_columns(
-        pd.DataFrame(issues), ["Issue", "Table", "Objects", "Severity", "Why it matters"]
+        pd.DataFrame(issues),
+        ["Issue", "Table", "Objects", "Severity", "Why it matters", "How to Fix"],
     )
     return tree, sort_by_severity(issues_df)
 
@@ -3198,7 +3249,7 @@ def simulate_rls(model: Dict[str, Any]) -> pd.DataFrame:
     silent failure this simulates: the role looks configured, the data isn't
     actually secured.
     """
-    schema = ["Role", "Secured Table", "Table", "Rows Filtered?", "Severity", "Path / Reason"]
+    schema = ["Role", "Secured Table", "Table", "Rows Filtered?", "Severity", "Path / Reason", "How to Fix"]
     roles = model["roles"]
     if roles.empty or "Role" not in roles.columns:
         return _ensure_columns(pd.DataFrame(), schema)
@@ -3241,6 +3292,9 @@ def simulate_rls(model: Dict[str, Any]) -> pd.DataFrame:
                 "Rows Filtered?": "No", "Severity": "Medium",
                 "Path / Reason": "This role has no table permissions at all — it grants "
                                  "unrestricted read access to the whole model.",
+                "How to Fix": "Power BI Desktop: Modeling ➜ Manage roles ➜ select this role ➜ add "
+                              "a table and a DAX filter expression — or delete the role if it's "
+                              "unused.",
             })
             continue
 
@@ -3260,6 +3314,7 @@ def simulate_rls(model: Dict[str, Any]) -> pd.DataFrame:
                 if protected:
                     sev = "Info"
                     reason = reached[table]
+                    fix = "No action needed — this table is already secured."
                 else:
                     # Is it unreachable because of direction, or not connected at all?
                     connected = any(
@@ -3272,13 +3327,20 @@ def simulate_rls(model: Dict[str, Any]) -> pd.DataFrame:
                         reason = (f"Related to {start}, but the filter can't travel that way — "
                                   "it would have to go many→one across a single-direction "
                                   "relationship. Rows here are NOT secured.")
+                        fix = (f"Power BI Desktop: Model view ➜ select the relationship between "
+                               f"{start} and {table} ➜ tick *Apply security filter in both "
+                               "directions* (bi-directional only for RLS, not for report "
+                               "filtering) — or move the role's filter onto the dimension side "
+                               "of the relationship instead of the fact side.")
                     else:
                         sev = "Low"
                         reason = f"No filter path from {start}; this table is unaffected by the role."
+                        fix = ("Expected if this table is genuinely unrelated to what the role "
+                               "secures — add a relationship first if it should be in scope.")
                 rows.append({
                     "Role": str(role_name), "Secured Table": start, "Table": table,
                     "Rows Filtered?": "Yes" if protected else "No",
-                    "Severity": sev, "Path / Reason": reason,
+                    "Severity": sev, "Path / Reason": reason, "How to Fix": fix,
                 })
 
     return _ensure_columns(pd.DataFrame(rows), schema)
@@ -3375,23 +3437,44 @@ def compare_models(base: Dict[str, Any], other: Dict[str, Any]) -> Dict[str, Any
             continue
         if changed:
             sev, what = "High", "DAX changed"
+            why = ("The same measure name now computes something different than the certified "
+                   "baseline — anything trusting the name (reports, other measures, documentation) "
+                   "is silently reading the wrong logic.")
+            fix = ("Compare the DAX side by side below. If the change is intentional, update the "
+                   "baseline .vpax to match; if it's not, revert this measure's expression to the "
+                   "baseline's, or rename the local version so it stops shadowing the certified one.")
         else:
             sev, what = "Medium", "Moved to a different home table"
+            why = "Same name and logic, but a different home table can break fully-qualified references."
+            fix = ("Confirm the move was deliberate. If not, move the measure back to its "
+                   "original table (Tabular Editor: drag the measure between tables in the "
+                   "Explorer pane).")
         drift_rows.append({
             "Measure": name, "Change": what, "Severity": sev,
             "Baseline Table": b_table, "Compared Table": o_table,
+            "Why It Matters": why, "How to Fix": fix,
             "Baseline DAX": b_expr, "Compared DAX": o_expr,
         })
     for name in sorted(set(om) - set(bm)):
-        added_rows.append({"Measure": name, "Table": om[name][0], "Severity": "Medium",
-                           "DAX": om[name][1],
-                           "Note": "Exists only in the compared model — a local metric that "
-                                   "isn't part of the certified set."})
+        added_rows.append({
+            "Measure": name, "Table": om[name][0], "Severity": "Medium", "DAX": om[name][1],
+            "Note": "Exists only in the compared model — a local metric that "
+                    "isn't part of the certified set.",
+            "How to Fix": "If this is a genuinely new, approved metric, add it to the certified "
+                          "baseline so it's tracked going forward. If it's a one-off, keep it — "
+                          "just be aware it won't appear when comparing other models against the "
+                          "same baseline.",
+        })
     for name in sorted(set(bm) - set(om)):
-        removed_rows.append({"Measure": name, "Table": bm[name][0], "Severity": "High",
-                             "DAX": bm[name][1],
-                             "Note": "Present in the baseline but missing here — anything "
-                                     "referencing it will break."})
+        removed_rows.append({
+            "Measure": name, "Table": bm[name][0], "Severity": "High", "DAX": bm[name][1],
+            "Note": "Present in the baseline but missing here — anything "
+                    "referencing it will break.",
+            "How to Fix": "Check Investigate ➜ Impact Analysis on this measure name against the "
+                          "baseline model to see what depended on it, then restore the measure "
+                          "(or repoint those dependents at its replacement) before this model "
+                          "replaces the baseline.",
+        })
 
     def name_set(m: Dict[str, Any], kind: str) -> Set[str]:
         if kind == "tables":
@@ -3428,9 +3511,11 @@ def compare_models(base: Dict[str, Any], other: Dict[str, Any]) -> Dict[str, Any
     return {
         "drift": _ensure_columns(pd.DataFrame(drift_rows), [
             "Measure", "Change", "Severity", "Baseline Table", "Compared Table",
-            "Baseline DAX", "Compared DAX"]),
-        "added": _ensure_columns(pd.DataFrame(added_rows), ["Measure", "Table", "Severity", "DAX", "Note"]),
-        "removed": _ensure_columns(pd.DataFrame(removed_rows), ["Measure", "Table", "Severity", "DAX", "Note"]),
+            "Why It Matters", "How to Fix", "Baseline DAX", "Compared DAX"]),
+        "added": _ensure_columns(pd.DataFrame(added_rows),
+                                 ["Measure", "Table", "Severity", "DAX", "Note", "How to Fix"]),
+        "removed": _ensure_columns(pd.DataFrame(removed_rows),
+                                   ["Measure", "Table", "Severity", "DAX", "Note", "How to Fix"]),
         "structure": _ensure_columns(pd.DataFrame(struct_rows), ["Object Type", "Object", "Change", "Severity"]),
     }
 
@@ -3618,7 +3703,8 @@ def validate_report_bindings(bindings: pd.DataFrame, model: Dict[str, Any]) -> p
     the report breaks - Power BI only surfaces that when a user opens the
     page. Comparing the two catches it before they do.
     """
-    schema = ["Page", "Visual", "Visual Type", "Kind", "Table", "Field", "Severity", "Problem"]
+    schema = ["Page", "Visual", "Visual Type", "Kind", "Table", "Field", "Severity",
+              "Problem", "How to Fix"]
     if bindings.empty:
         return _ensure_columns(pd.DataFrame(), schema)
 
@@ -3655,9 +3741,14 @@ def validate_report_bindings(bindings: pd.DataFrame, model: Dict[str, Any]) -> p
             # a literal, not a broken reference - reporting it would be noise.
             continue
         if table not in tables:
-            rows.append({**b.to_dict(), "Severity": "High",
-                         "Problem": f"Table `{table}` doesn't exist in this model. The visual "
-                                    "will error or render blank."})
+            rows.append({
+                **b.to_dict(), "Severity": "High",
+                "Problem": f"Table `{table}` doesn't exist in this model. The visual "
+                           "will error or render blank.",
+                "How to Fix": f"Open the report, go to page **{b['Page']}**, select the visual "
+                              f"and rebind its fields to a table that still exists — or delete "
+                              "the visual if `{table}` was removed on purpose.",
+            })
             continue
         if kind == "Measure":
             if (table, field) in measure_pairs:
@@ -3669,15 +3760,22 @@ def validate_report_bindings(bindings: pd.DataFrame, model: Dict[str, Any]) -> p
             if (table, field) in col_pairs:
                 continue
             problem = f"No measure named `{field}` on `{table}`."
+            fix = (f"The measure was likely renamed or deleted. Open page **{b['Page']}**, "
+                   f"select the visual, and rebind it to the measure's new name — check "
+                   "Investigate ➜ Measure Dependencies if you're not sure what replaced it.")
         elif kind == "Hierarchy level":
             if (table, field) in hierarchy_levels or (table, field) in col_pairs:
                 continue
             problem = f"No hierarchy level `{field}` on `{table}`."
+            fix = (f"Open page **{b['Page']}**, select the visual, and rebind it to a level that "
+                   f"still exists on `{table}`'s hierarchy (or to the plain column).")
         else:
             if (table, field) in col_pairs or (table, field) in measure_pairs:
                 continue
             problem = f"No column named `{field}` on `{table}`."
-        rows.append({**b.to_dict(), "Severity": "High", "Problem": problem})
+            fix = (f"The column was likely renamed or deleted. Open page **{b['Page']}**, select "
+                   f"the visual, and rebind it to the correct field on `{table}`.")
+        rows.append({**b.to_dict(), "Severity": "High", "Problem": problem, "How to Fix": fix})
 
     return sort_by_severity(_ensure_columns(pd.DataFrame(rows), schema))
 
@@ -4338,10 +4436,21 @@ def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
     return buf.getvalue()
 
 
-def show_table(df: pd.DataFrame, name: str, height: int = 380, key: str = "") -> None:
-    """Render a dataframe with CSV + XLSX download buttons."""
+def show_table(
+    df: pd.DataFrame, name: str, height: int = 380, key: str = "", row_height: int = 68
+) -> None:
+    """Render a dataframe with CSV + XLSX download buttons.
+
+    `row_height` turns on word-wrap: Streamlit's dataframe grid only wraps
+    text within a row when given an explicit pixel height taller than one
+    line - left at its default (auto), long text is silently truncated with
+    no ellipsis. There's no per-row auto-height in this grid, so every row
+    in a table shares one height; callers with especially long text columns
+    (recommendations, DAX, multi-sentence explanations) should pass a taller
+    value so their longest cells don't get clipped.
+    """
     safe = _safe(df)
-    st.dataframe(safe, width="stretch", height=height, hide_index=True)
+    st.dataframe(safe, width="stretch", height=height, hide_index=True, row_height=row_height)
 
     slug = _slug(name)
     col1, col2, _ = st.columns([1, 1, 6])
@@ -5196,13 +5305,13 @@ if nav_page == "Semantic Model by Screen":
                     keep = [c for c in ("MeasureName", "MeasureExpression", "FormatString") if c in screen_measures.columns]
                     with st.expander(f"Measures on this screen ({len(screen_measures)})"):
                         show_table(screen_measures[keep].reset_index(drop=True),
-                                   f"{screen_table} measures", height=330, key=f"meas_{idx}")
+                                   f"{screen_table} measures", height=330, key=f"meas_{idx}", row_height=110)
 
 # --- Tables ---------------------------------------------------------------
 if nav_page == "Tables":
     with tab_guard('Tables'):
         st.subheader("Tables in the model")
-        show_table(model["tables"], "Tables", height=420, key="tables")
+        show_table(model["tables"], "Tables", height=420, key="tables", row_height=90)
 
 # --- Columns / Schema -----------------------------------------------------
 if nav_page == "Columns / Schema":
@@ -5213,14 +5322,14 @@ if nav_page == "Columns / Schema":
             st.info("No column metadata found.")
         elif "TableName" not in schema_df.columns:
             # Filtering needs the column; without it just show what we have.
-            show_table(schema_df.reset_index(drop=True), "Columns", height=460, key="columns")
+            show_table(schema_df.reset_index(drop=True), "Columns", height=460, key="columns", row_height=90)
         else:
             # key=str: a model can mix numeric and text table names, and
             # sorting those against each other raises TypeError.
             options = sorted(schema_df["TableName"].dropna().unique().tolist(), key=str)
             chosen = st.multiselect("Filter by table", options=options, key="schema_filter")
             view = schema_df[schema_df["TableName"].isin(chosen)] if chosen else schema_df
-            show_table(view.reset_index(drop=True), "Columns", height=460, key="columns")
+            show_table(view.reset_index(drop=True), "Columns", height=460, key="columns", row_height=90)
 
 # --- Measures -------------------------------------------------------------
 if nav_page == "Measures":
@@ -5245,7 +5354,7 @@ if nav_page == "Measures":
                     enriched["MeasureName"].str.contains(search, case=False, na=False)
                     | enriched["MeasureExpression"].str.contains(search, case=False, na=False)
                 ]
-            show_table(view.reset_index(drop=True), "Measures", height=460, key="measures")
+            show_table(view.reset_index(drop=True), "Measures", height=460, key="measures", row_height=130)
 
 # --- Calculated Columns ---------------------------------------------------
 if nav_page == "Calculated Columns":
@@ -5256,7 +5365,7 @@ if nav_page == "Calculated Columns":
             st.info("No calculated columns found in this model.")
         else:
             enriched = add_optimized_dax(cols_df, "ColumnExpression", model["measure_names"], model["column_tables"])
-            show_table(enriched.reset_index(drop=True), "Calculated Columns", height=460, key="calccols")
+            show_table(enriched.reset_index(drop=True), "Calculated Columns", height=460, key="calccols", row_height=130)
 
 # --- Relationships --------------------------------------------------------
 if nav_page == "Relationships":
@@ -5290,7 +5399,7 @@ if nav_page == "Power Query (SQL)":
                 + sorted(with_sql["TableName"].dropna().unique().tolist(), key=str),
             )
             if choice.startswith("(all"):
-                show_table(pq_df.reset_index(drop=True), "Power Query SQL", height=460, key="pq")
+                show_table(pq_df.reset_index(drop=True), "Power Query SQL", height=460, key="pq", row_height=140)
             else:
                 matches = with_sql.loc[with_sql["TableName"] == choice, "SQL"]
                 sql = str(matches.iloc[0]) if not matches.empty else ""
@@ -5430,9 +5539,9 @@ if nav_page == "Impact Analysis":
 
         if result is not None:
             st.markdown(f"**Measures referencing `{label}`** ({len(result['measures'])})")
-            show_table(result["measures"].reset_index(drop=True), f"{label} measures", height=260, key="impact_measures")
+            show_table(result["measures"].reset_index(drop=True), f"{label} measures", height=260, key="impact_measures", row_height=110)
             st.markdown(f"**Calculated columns referencing `{label}`** ({len(result['calc_columns'])})")
-            show_table(result["calc_columns"].reset_index(drop=True), f"{label} calc columns", height=220, key="impact_calc")
+            show_table(result["calc_columns"].reset_index(drop=True), f"{label} calc columns", height=220, key="impact_calc", row_height=110)
             st.markdown(f"**Relationships involving `{label}`** ({len(result['relationships'])})")
             show_table(result["relationships"].reset_index(drop=True), f"{label} relationships", height=220, key="impact_rels")
             if target_kind == "Table" and not result["related_tables"].empty:
@@ -5460,7 +5569,7 @@ if nav_page == "Measure Dependencies":
                     "fully evaluate: " + "; ".join(" → ".join(c) for c in cycles[:5])
                 )
             dep_table = build_measure_dependency_table(graph)
-            show_table(dep_table, "Measure Dependencies", height=460, key="measure_deps")
+            show_table(dep_table, "Measure Dependencies", height=460, key="measure_deps", row_height=90)
 
             if any(graph.values()):
                 with st.expander("Show as a diagram"):
@@ -5501,7 +5610,7 @@ if nav_page == "Model Health":
                 key="health_only_high",
             )
             view = health_df[health_df["Severity"] == "High"] if only_high else health_df
-            show_table(sort_by_severity(view), "Model Health", height=460, key="health")
+            show_table(sort_by_severity(view), "Model Health", height=460, key="health", row_height=120)
             st.caption(
                 "Mechanical fixes for several of these — hiding join keys, dropping unused "
                 "attribute hierarchies, adding format strings — are generated as a runnable "
@@ -5523,7 +5632,7 @@ if nav_page == "Naming Conventions":
             kinds = ["(all)"] + sorted(naming_df["Object Type"].dropna().unique().tolist())
             pick_kind = st.selectbox("Object type", kinds, key="naming_kind")
             view = naming_df if pick_kind == "(all)" else naming_df[naming_df["Object Type"] == pick_kind]
-            show_table(sort_by_severity(view), "Naming Conventions", height=460, key="naming")
+            show_table(sort_by_severity(view), "Naming Conventions", height=460, key="naming", row_height=90)
             st.caption(
                 "**Govern ➜ Fix Script (C#)** emits these as ready-to-run renames — commented "
                 "out, because a rename breaks every visual that referenced the old name. "
@@ -5555,7 +5664,7 @@ if nav_page == "Security & Perspectives":
             if roles_df.empty:
                 st.info("No RLS roles defined in this model.")
             else:
-                show_table(roles_df, "Roles", height=380, key="roles")
+                show_table(roles_df, "Roles", height=380, key="roles", row_height=110)
         with sub[1]:
             persp_df = model["perspectives"]
             if persp_df.empty:
@@ -5683,7 +5792,7 @@ if nav_page == "Display Folders":
                 + ", ".join(f"{n} {s.lower()}" for s, n in counts.items()),
                 icon="🗂️",
             )
-            show_table(taxonomy_issues, "Taxonomy Issues", height=240, key="tax_issues")
+            show_table(taxonomy_issues, "Taxonomy Issues", height=240, key="tax_issues", row_height=110)
         else:
             st.success("No orphaned measures or visible join keys found.", icon="✅")
 
@@ -5746,7 +5855,7 @@ if nav_page == "Compression Advisor":
             c1.metric("🔴 High", counts.get("High", 0), help="Large, clearly fixable waste.")
             c2.metric("🟠 Medium", counts.get("Medium", 0))
             c3.metric("Columns advised", len(encoding_df))
-            show_table(encoding_df, "Compression Advice", height=440, key="encoding")
+            show_table(encoding_df, "Compression Advice", height=440, key="encoding", row_height=130)
             with st.expander("How to act on these"):
                 st.markdown(
                     "- **HASH on a numeric column** — set `EncodingHint = Value` in Tabular "
@@ -5787,7 +5896,7 @@ if nav_page == "Fabric Readiness":
             st.warning("No hard blockers, but some items need attention before migrating.", icon="🟠")
         else:
             st.success("No Direct Lake blockers detected in this export.", icon="✅")
-        show_table(fabric_df, "Fabric Readiness", height=420, key="fabric")
+        show_table(fabric_df, "Fabric Readiness", height=420, key="fabric", row_height=130)
         st.info(
             "**What this can't see:** whether the source Delta tables are V-Order optimised, "
             "the size and count of Parquet row groups, or the capacity SKU you're targeting. "
@@ -5832,8 +5941,9 @@ if nav_page == "Model Compare":
             if not drift.empty:
                 st.markdown("#### 🔴 Metric drift")
                 show_table(
-                    drift[["Measure", "Change", "Severity", "Baseline Table", "Compared Table"]],
-                    "Metric Drift", height=260, key="drift",
+                    drift[["Measure", "Change", "Severity", "Baseline Table", "Compared Table",
+                           "Why It Matters", "How to Fix"]],
+                    "Metric Drift", height=260, key="drift", row_height=120,
                 )
                 pick = st.selectbox("Inspect the DAX for", drift["Measure"].tolist(), key="drift_pick")
                 row = drift[drift["Measure"] == pick].iloc[0]
@@ -5851,12 +5961,12 @@ if nav_page == "Model Compare":
 
             if not removed.empty:
                 st.markdown("#### Missing from this model")
-                show_table(removed[["Measure", "Table", "Severity", "Note"]],
-                           "Missing Measures", height=220, key="cmp_removed")
+                show_table(removed[["Measure", "Table", "Severity", "Note", "How to Fix"]],
+                           "Missing Measures", height=220, key="cmp_removed", row_height=100)
             if not added.empty:
                 st.markdown("#### Only in this model")
-                show_table(added[["Measure", "Table", "Severity", "Note"]],
-                           "Extra Measures", height=220, key="cmp_added")
+                show_table(added[["Measure", "Table", "Severity", "Note", "How to Fix"]],
+                           "Extra Measures", height=220, key="cmp_added", row_height=100)
             if not diff["structure"].empty:
                 with st.expander(f"Structural differences ({len(diff['structure'])})"):
                     show_table(diff["structure"], "Structure Diff", height=320, key="cmp_struct")
@@ -5886,7 +5996,7 @@ if nav_page == "RLS Simulator":
                     "filter can't cross a single-direction relationship.", icon="🔴",
                 )
             st.markdown("#### Per-role verdict")
-            show_table(rls_summary_df, "RLS Summary", height=240, key="rls_summary")
+            show_table(rls_summary_df, "RLS Summary", height=240, key="rls_summary", row_height=90)
 
             roles_list = sorted(rls_sim_df["Role"].dropna().unique().tolist())
             picked_role = st.selectbox("Trace filter propagation for", roles_list, key="rls_role")
@@ -5903,7 +6013,7 @@ if nav_page == "RLS Simulator":
                     icon="✅",
                 )
             else:
-                show_table(sort_by_severity(view), f"RLS {picked_role}", height=380, key="rls_trace")
+                show_table(sort_by_severity(view), f"RLS {picked_role}", height=380, key="rls_trace", row_height=120)
             with st.expander("How to fix a trapped filter"):
                 st.markdown(
                     "In order of preference:\n\n"
@@ -5998,7 +6108,7 @@ if nav_page == "Report Usage":
                     "These visuals will error or render blank when someone opens the page.",
                     icon="🔴",
                 )
-                show_table(broken_df, "Broken Visuals", height=320, key="broken_visuals")
+                show_table(broken_df, "Broken Visuals", height=320, key="broken_visuals", row_height=110)
 
             st.markdown("#### Delete safety per column")
             hide_kept = st.checkbox("Show only columns safe to delete", value=True, key="disp_only_safe")
@@ -6007,7 +6117,7 @@ if nav_page == "Report Usage":
             if view.empty:
                 st.success("Nothing is safe to delete — every column earns its place.", icon="✅")
             else:
-                show_table(view, "Column Disposition", height=400, key="disposition")
+                show_table(view, "Column Disposition", height=400, key="disposition", row_height=90)
             st.warning(
                 "**One .pbix speaks for one report.** If other reports, paginated reports, "
                 "Excel workbooks or XMLA clients connect to this same semantic model, they "
@@ -6049,7 +6159,7 @@ if nav_page == "Duplicate Measures":
             show_table(
                 dupes[["Measure A", "Table A", "Measure B", "Table B", "Similarity %",
                        "Severity", "Verdict"]],
-                "Near-Duplicate Measures", height=340, key="dupes",
+                "Near-Duplicate Measures", height=340, key="dupes", row_height=100,
             )
             labels = [f"{r['Measure A']}  ↔  {r['Measure B']}  ({r['Similarity %']}%)"
                       for _, r in dupes.iterrows()]
@@ -6090,7 +6200,7 @@ if nav_page == "Field Parameters":
                     "visual actually binds to. Without it, they can only be listed.",
                     icon="🖥️",
                 )
-            show_table(field_params_df, "Field Parameters", height=360, key="field_params")
+            show_table(field_params_df, "Field Parameters", height=360, key="field_params", row_height=110)
             st.caption(
                 "Removing an unused one takes the table, its visible label column, its hidden "
                 "field column and its sort-order column with it — **Govern ➜ Model Cleanup** "
@@ -6137,7 +6247,7 @@ if nav_page == "Source Lineage":
             k[2].metric("Distinct schemas", lineage["Schema"].replace("", pd.NA).nunique())
 
             st.markdown("#### If a source table is dropped, these break")
-            show_table(impact, "Source Impact", height=280, key="source_impact")
+            show_table(impact, "Source Impact", height=280, key="source_impact", row_height=90)
 
             st.markdown("#### Source ➜ model mapping")
             show_table(lineage, "Source Lineage", height=320, key="lineage")
