@@ -103,6 +103,7 @@ import math
 import re
 import traceback
 import zipfile
+import difflib
 from collections import deque
 from contextlib import contextmanager
 from functools import lru_cache
@@ -504,31 +505,86 @@ def _build_perspectives(bim: Dict[str, Any]) -> pd.DataFrame:
     return _ensure_columns(pd.DataFrame(rows), ["Perspective", "Table", "Object", "Object Type"])
 
 
+_M_ESCAPES = {"lf": "\n", "cr": "\r", "tab": "\t", "#": "#"}
+
+
+def _decode_m_escapes(text: str) -> str:
+    """Turn M's `#(lf)` / `#(tab)` escape sequences back into real characters.
+
+    Power BI writes native queries on one physical line with the newlines
+    encoded, so without this the SQL arrives as an unreadable single line and
+    any parser choking on it would be our fault, not the query's.
+    """
+    def sub(match: "re.Match[str]") -> str:
+        parts = match.group(1).split(",")
+        out = []
+        for p in parts:
+            p = p.strip().lower()
+            if p in _M_ESCAPES:
+                out.append(_M_ESCAPES[p])
+            elif re.fullmatch(r"[0-9a-f]{4}|[0-9a-f]{8}", p):
+                try:
+                    out.append(chr(int(p, 16)))
+                except ValueError:
+                    return match.group(0)
+            else:
+                return match.group(0)     # unknown escape - leave it alone
+        return "".join(out)
+
+    return re.sub(r"#\(([^)]*)\)", sub, text)
+
+
+def _m_string_literals(m_expression: str) -> List[str]:
+    """Every string literal in an M expression, with `""` unescaped."""
+    out: List[str] = []
+    i, n = 0, len(m_expression)
+    while i < n:
+        if m_expression[i] != '"':
+            i += 1
+            continue
+        i += 1
+        buf: List[str] = []
+        while i < n:
+            ch = m_expression[i]
+            if ch == '"':
+                if i + 1 < n and m_expression[i + 1] == '"':
+                    buf.append('"')
+                    i += 2
+                    continue
+                i += 1
+                break
+            buf.append(ch)
+            i += 1
+        out.append("".join(buf))
+    return out
+
+
+_SQL_START_RE = re.compile(r"^\s*(with|select)\b", re.I)
+
+
 def extract_sql(m_expression: str) -> str:
     """Pull just the SQL out of a Power Query M expression.
 
-    The SQL sits in a `query = "..."` parameter. It's an M string literal, so
-    an embedded double quote is escaped by doubling it - scan accordingly
-    rather than searching for a fixed end marker.
+    There are several shapes in the wild - `Sql.Database(..., [Query="..."])`,
+    `Value.NativeQuery(source, "...")`, `Odbc.Query(..., "...")` - and rather
+    than pattern-match each connector, this scans every M string literal and
+    keeps the ones that actually parse as a query. That way a connector we
+    haven't seen still works. When a table's query is assembled from more than
+    one literal, the longest genuine query wins.
     """
     if not m_expression:
         return ""
-    match = re.search(r"query\s*=\s*\"", m_expression)
-    if not match:
-        return ""
-    out: List[str] = []
-    i = match.end()
-    while i < len(m_expression):
-        ch = m_expression[i]
-        if ch == '"':
-            if i + 1 < len(m_expression) and m_expression[i + 1] == '"':
-                out.append('"')
-                i += 2
-                continue
-            break
-        out.append(ch)
-        i += 1
-    return "".join(out).strip()
+    best = ""
+    for literal in _m_string_literals(m_expression):
+        sql = _decode_m_escapes(literal).strip()
+        if len(sql) < 12:
+            continue
+        looks_like_sql = bool(_SQL_START_RE.match(sql)) or (
+            re.search(r"\bselect\b", sql, re.I) and re.search(r"\bfrom\b", sql, re.I)
+        )
+        if looks_like_sql and len(sql) > len(best):
+            best = sql
+    return best
 
 
 def _read_legacy_layout(z: zipfile.ZipFile) -> Optional[Dict[str, Any]]:
@@ -553,9 +609,116 @@ def _read_legacy_layout(z: zipfile.ZipFile) -> Optional[Dict[str, Any]]:
     return data
 
 
+def _maybe_json(value: Any) -> Any:
+    """Parse a value that might be JSON embedded in a string.
+
+    The classic Layout format stores each visual's whole definition as a JSON
+    *string* inside a JSON document, sometimes two levels deep. Trying to
+    parse anything that looks like an object or array is how the walker below
+    reaches those inner definitions without special-casing each key.
+    """
+    if not isinstance(value, str):
+        return value
+    s = value.strip()
+    if not s or s[0] not in "{[":
+        return value
+    try:
+        return json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        return value
+
+
+def _collect_field_refs(
+    node: Any,
+    aliases: Optional[Dict[str, str]] = None,
+    out: Optional[List[Tuple[str, str, str]]] = None,
+    depth: int = 0,
+) -> List[Tuple[str, str, str]]:
+    """Every (table, field, kind) a chunk of report JSON binds to.
+
+    Power BI writes field references two ways. Sometimes the table is named
+    inline (`SourceRef.Entity`), and sometimes the reference points at an
+    alias (`SourceRef.Source`) declared in the enclosing query's `From`
+    clause - so aliases have to be carried down the tree as we descend, with
+    inner scopes shadowing outer ones. Both the classic Layout blob and the
+    newer PBIR visual.json use the same shapes, which is why one walker
+    serves both.
+    """
+    if out is None:
+        out = []
+    if depth > 60:          # cyclical or pathological nesting guard
+        return out
+    node = _maybe_json(node)
+
+    if isinstance(node, list):
+        for item in node:
+            _collect_field_refs(item, aliases, out, depth + 1)
+        return out
+    if not isinstance(node, dict):
+        return out
+
+    scope = dict(aliases or {})
+    from_clause = node.get("From")
+    if isinstance(from_clause, list):
+        for src in from_clause:
+            if isinstance(src, dict) and src.get("Name") and src.get("Entity"):
+                scope[str(src["Name"])] = str(src["Entity"])
+
+    def resolve(expr: Any) -> str:
+        """Table name out of a SourceRef, following an alias if needed."""
+        expr = _maybe_json(expr)
+        if not isinstance(expr, dict):
+            return ""
+        ref = expr.get("SourceRef")
+        if isinstance(ref, dict):
+            if ref.get("Entity"):
+                return str(ref["Entity"])
+            if ref.get("Source"):
+                return scope.get(str(ref["Source"]), "")
+        # Hierarchy levels wrap another expression one layer deeper.
+        for key in ("Expression", "Hierarchy"):
+            inner = expr.get(key)
+            if isinstance(inner, (dict, str)):
+                found = resolve(inner)
+                if found:
+                    return found
+        return ""
+
+    for key, kind in (("Column", "Column"), ("Measure", "Measure")):
+        ref = _maybe_json(node.get(key))
+        if isinstance(ref, dict) and ref.get("Property"):
+            out.append((resolve(ref.get("Expression")), str(ref["Property"]), kind))
+
+    hier = _maybe_json(node.get("HierarchyLevel"))
+    if isinstance(hier, dict) and hier.get("Level"):
+        out.append((resolve(hier.get("Expression")), str(hier["Level"]), "Hierarchy level"))
+
+    for value in node.values():
+        _collect_field_refs(value, scope, out, depth + 1)
+    return out
+
+
+def _visual_binding_rows(page: str, visual_id: str, visual_type: str, definition: Any) -> List[Dict[str, str]]:
+    seen: Set[Tuple[str, str, str]] = set()
+    rows: List[Dict[str, str]] = []
+    for table, field, kind in _collect_field_refs(definition):
+        if not field:
+            continue
+        key = (table, field, kind)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({
+            "Page": page, "Visual": visual_id, "Visual Type": visual_type or "(unknown)",
+            "Kind": kind, "Table": table, "Field": field,
+        })
+    return rows
+
+
 def _pages_from_legacy_layout(data: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Dict[str, Set[str]]]]:
     """Pages + field bindings from the classic single-blob Layout format."""
     rows, fields_by_page = [], {}
+    binding_rows: List[Dict[str, str]] = []
     for section in data.get("sections") or []:
         if not isinstance(section, dict):
             continue
@@ -574,6 +737,24 @@ def _pages_from_legacy_layout(data: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[
         entities = set(re.findall(r'"Entity"\s*:\s*"([^"]+)"', blob))
         properties = set(re.findall(r'"Property"\s*:\s*"([^"]+)"', blob))
         fields_by_page[name] = {"entities": entities, "properties": properties}
+
+        # Per-visual, table-qualified bindings. The page-level entity/property
+        # sets above stay as they are (other views depend on them) - these are
+        # the paired references the broken-visual check needs.
+        for idx, vc in enumerate(containers):
+            cfg_obj = _maybe_json(vc.get("config"))
+            vtype, vid = "", f"visual {idx + 1}"
+            if isinstance(cfg_obj, dict):
+                vid = str(cfg_obj.get("name") or vid)
+                sv = cfg_obj.get("singleVisual")
+                if isinstance(sv, dict):
+                    vtype = str(sv.get("visualType") or "")
+            binding_rows.extend(
+                _visual_binding_rows(name, vid, vtype, [cfg_obj, _maybe_json(vc.get("filters"))])
+            )
+        binding_rows.extend(
+            _visual_binding_rows(name, "(page filters)", "filter", _maybe_json(section.get("filters")))
+        )
         rows.append({
             "Order": pd.to_numeric(section.get("ordinal"), errors="coerce"),
             "Screen / Page Name": name,
@@ -586,10 +767,20 @@ def _pages_from_legacy_layout(data: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[
     if not pages.empty:
         pages["Hidden"] = pages["Hidden"].fillna(False).astype(bool)
         pages = pages.sort_values("Order", na_position="last").reset_index(drop=True)
-    return pages, fields_by_page
+    return pages, fields_by_page, _bindings_frame(binding_rows)
 
 
-def _pages_from_pbir(z: zipfile.ZipFile) -> Optional[Tuple[pd.DataFrame, Dict[str, Dict[str, Set[str]]]]]:
+BINDING_COLUMNS = ["Page", "Visual", "Visual Type", "Kind", "Table", "Field"]
+
+
+def _bindings_frame(rows: List[Dict[str, str]]) -> pd.DataFrame:
+    df = _ensure_columns(pd.DataFrame(rows), BINDING_COLUMNS)
+    if df.empty:
+        return df
+    return df.drop_duplicates().reset_index(drop=True)
+
+
+def _pages_from_pbir(z: zipfile.ZipFile) -> Optional[Tuple[pd.DataFrame, Dict[str, Dict[str, Set[str]]], pd.DataFrame]]:
     """Pages + field bindings from the newer PBIR project format.
 
     Recent Power BI Desktop versions export reports as a folder tree
@@ -613,6 +804,7 @@ def _pages_from_pbir(z: zipfile.ZipFile) -> Optional[Tuple[pd.DataFrame, Dict[st
         })
 
     rows, fields_by_page = [], {}
+    binding_rows: List[Dict[str, str]] = []
     for ordinal, page_id in enumerate(order):
         page_key = f"{prefix}{page_id}/page.json"
         if page_key not in norm:
@@ -629,6 +821,17 @@ def _pages_from_pbir(z: zipfile.ZipFile) -> Optional[Tuple[pd.DataFrame, Dict[st
         properties = set(re.findall(r'"Property"\s*:\s*"([^"]+)"', blob))
         fields_by_page[name] = {"entities": entities, "properties": properties}
 
+        for k in visual_keys:
+            try:
+                vdef = _read_json_member(z, norm[k])
+            except (json.JSONDecodeError, KeyError, UnicodeDecodeError):
+                continue
+            vis = vdef.get("visual") if isinstance(vdef.get("visual"), dict) else {}
+            vid = str(vdef.get("name") or k.rsplit("/", 2)[-2])
+            binding_rows.extend(
+                _visual_binding_rows(name, vid, str(vis.get("visualType") or ""), vdef)
+            )
+
         rows.append({
             "Order": ordinal,
             "Screen / Page Name": name,
@@ -643,7 +846,7 @@ def _pages_from_pbir(z: zipfile.ZipFile) -> Optional[Tuple[pd.DataFrame, Dict[st
     if not pages.empty:
         pages["Hidden"] = pages["Hidden"].fillna(False).astype(bool)
         pages = pages.sort_values("Order", na_position="last").reset_index(drop=True)
-    return pages, fields_by_page
+    return pages, fields_by_page, _bindings_frame(binding_rows)
 
 
 def _read_pbir_report_json(z: zipfile.ZipFile) -> Optional[Dict[str, Any]]:
@@ -734,7 +937,7 @@ def load_report_pages(pbix_bytes: bytes) -> Dict[str, Any]:
     with zipfile.ZipFile(io.BytesIO(pbix_bytes)) as z:
         legacy = _read_legacy_layout(z)
         if legacy is not None:
-            pages, fields_by_page = _pages_from_legacy_layout(legacy)
+            pages, fields_by_page, bindings = _pages_from_legacy_layout(legacy)
         else:
             pbir = _pages_from_pbir(z)
             if pbir is None:
@@ -742,12 +945,13 @@ def load_report_pages(pbix_bytes: bytes) -> Dict[str, Any]:
                     "No 'Report/Layout' part or 'Report/definition/pages' found - "
                     "this doesn't look like a .pbix report."
                 )
-            pages, fields_by_page = pbir
+            pages, fields_by_page, bindings = pbir
 
         report_defs = [d for d in (legacy, _read_pbir_report_json(z)) if d is not None]
         theme = extract_report_theme(z, report_defs)
 
-    return {"pages": pages, "fields_by_page": fields_by_page, "theme": theme}
+    return {"pages": pages, "fields_by_page": fields_by_page,
+            "bindings": bindings, "theme": theme}
 
 
 def tables_used_by_page(page_name: str, report: Dict[str, Any], model: Dict[str, Any]) -> Set[str]:
@@ -920,6 +1124,9 @@ def load_model(file_bytes: bytes) -> Dict[str, Any]:
         # taxonomy, model compare) can read properties VPA never exposes -
         # isHidden, displayFolder, partition mode, hierarchies, lineage tags.
         "bim_tables": bim_tables,
+        # The whole TOM document, so the cleanup module can emit a modified
+        # Model.bim rather than only describing what to delete.
+        "bim": bim,
         # Physical storage detail, used by the compression advisor. Present in
         # DAX Studio exports; absent in some Tabular Editor ones, hence the
         # tolerant _records() reader and the .empty checks downstream.
@@ -999,6 +1206,29 @@ def build_sample_vpax_bytes() -> bytes:
                     "partitions": [{"name": "Sales", "mode": "import",
                                     "source": {"type": "m", "expression": 'let\n  q = "SELECT * FROM fact_sales"\nin\n  q'}}],
                 },
+                # A field parameter nothing binds to - disconnected, so no other
+                # check in the app can see it, which is the whole point of
+                # having a dedicated one.
+                {
+                    "name": "Metric Selector",
+                    "columns": [
+                        {"name": "Metric Selector", "dataType": "string", "type": "calculatedTableColumn"},
+                        {"name": "Metric Fields", "dataType": "string", "type": "calculatedTableColumn",
+                         "isHidden": True,
+                         "extendedProperties": [
+                             {"type": "json", "name": "ParameterMetadata",
+                              "value": {"version": 3, "kind": 2}},
+                         ]},
+                        {"name": "Metric Order", "dataType": "int64", "type": "calculatedTableColumn",
+                         "isHidden": True},
+                    ],
+                    "measures": [],
+                    "partitions": [{"name": "Metric Selector", "mode": "import", "source": {
+                        "type": "calculated",
+                        "expression": '{\n  ("Sales", NAMEOF(\'Sales\'[Total Sales]), 0),\n'
+                                      '  ("Quantity", NAMEOF(\'Sales\'[Total Quantity]), 1)\n}',
+                    }}],
+                },
             ],
             "relationships": [
                 {"name": "r1", "fromTable": "Sales", "fromColumn": "DateKey",
@@ -1029,10 +1259,19 @@ def build_sample_vpax_bytes() -> bytes:
     # real folder structure and one measure that fell out of it.
     measure_folders = {"Total Sales": "Sales", "Total Quantity": "Sales", "Sales YTD": "Time Intelligence"}
     row_counts = {"Date": 1461, "Product": 5200, "Customer": 84000, "Sales": 3_200_000}
+
+    def _table_expression(t: Dict[str, Any]) -> str:
+        for p in t.get("partitions") or []:
+            src = (p or {}).get("source") or {}
+            if str(src.get("type")) == "calculated":
+                return str(src.get("expression") or "")
+        return ""
+
     vpa = {
         "Tables": [
             {"TableName": t["name"], "RowsCount": row_counts.get(t["name"], 100),
-             "Description": "", "IsReferenced": True}
+             "Description": "", "IsReferenced": True,
+             "TableExpression": _table_expression(t)}
             for t in bim["model"]["tables"]
         ],
         "Columns": [
@@ -3358,6 +3597,602 @@ def build_te_script(
 
 
 # ==========================================================================
+# Report-level usage: broken visuals and true "safe to delete"
+# ==========================================================================
+
+def _report_bindings(report: Optional[Dict[str, Any]]) -> pd.DataFrame:
+    if not report:
+        return _ensure_columns(pd.DataFrame(), BINDING_COLUMNS)
+    df = report.get("bindings")
+    if not isinstance(df, pd.DataFrame):
+        return _ensure_columns(pd.DataFrame(), BINDING_COLUMNS)
+    return df
+
+
+def validate_report_bindings(bindings: pd.DataFrame, model: Dict[str, Any]) -> pd.DataFrame:
+    """Find visuals bound to model objects that no longer exist.
+
+    This is the other half of impact analysis. A .vpax alone tells you what
+    the model contains; the .pbix tells you what the report *asks for*. When
+    somebody renames or deletes a column, the model stays perfectly valid and
+    the report breaks - Power BI only surfaces that when a user opens the
+    page. Comparing the two catches it before they do.
+    """
+    schema = ["Page", "Visual", "Visual Type", "Kind", "Table", "Field", "Severity", "Problem"]
+    if bindings.empty:
+        return _ensure_columns(pd.DataFrame(), schema)
+
+    tables = set(model["all_table_names"])
+    cols = _user_facing_columns(model["columns"])
+    col_pairs: Set[Tuple[str, str]] = set()
+    if {"TableName", "ColumnName"}.issubset(cols.columns):
+        col_pairs = {(str(r["TableName"]), str(r["ColumnName"]))
+                     for _, r in cols.dropna(subset=["TableName", "ColumnName"]).iterrows()}
+    meas = model["measures"]
+    measure_pairs: Set[Tuple[str, str]] = set()
+    measure_any: Set[str] = set()
+    if {"TableName", "MeasureName"}.issubset(meas.columns):
+        for _, r in meas.dropna(subset=["MeasureName"]).iterrows():
+            measure_pairs.add((str(r["TableName"]), str(r["MeasureName"])))
+            measure_any.add(str(r["MeasureName"]))
+
+    # Hierarchies are declared in the TOM, not in the VPA column list.
+    hierarchy_levels: Set[Tuple[str, str]] = set()
+    for t in model.get("bim_tables") or []:
+        tname = str(t.get("name") or "")
+        for h in t.get("hierarchies") or []:
+            if not isinstance(h, dict):
+                continue
+            for lvl in h.get("levels") or []:
+                if isinstance(lvl, dict) and lvl.get("name"):
+                    hierarchy_levels.add((tname, str(lvl["name"])))
+
+    rows: List[Dict[str, Any]] = []
+    for _, b in bindings.iterrows():
+        table, field, kind = str(b["Table"]), str(b["Field"]), str(b["Kind"])
+        if not table:
+            # An unresolvable alias usually means a visual-level calculation or
+            # a literal, not a broken reference - reporting it would be noise.
+            continue
+        if table not in tables:
+            rows.append({**b.to_dict(), "Severity": "High",
+                         "Problem": f"Table `{table}` doesn't exist in this model. The visual "
+                                    "will error or render blank."})
+            continue
+        if kind == "Measure":
+            if (table, field) in measure_pairs:
+                continue
+            if field in measure_any:
+                # Measures can be moved between home tables without breaking
+                # the report, so this is informational, not a break.
+                continue
+            if (table, field) in col_pairs:
+                continue
+            problem = f"No measure named `{field}` on `{table}`."
+        elif kind == "Hierarchy level":
+            if (table, field) in hierarchy_levels or (table, field) in col_pairs:
+                continue
+            problem = f"No hierarchy level `{field}` on `{table}`."
+        else:
+            if (table, field) in col_pairs or (table, field) in measure_pairs:
+                continue
+            problem = f"No column named `{field}` on `{table}`."
+        rows.append({**b.to_dict(), "Severity": "High", "Problem": problem})
+
+    return sort_by_severity(_ensure_columns(pd.DataFrame(rows), schema))
+
+
+def classify_column_disposition(
+    model: Dict[str, Any], unused_df: pd.DataFrame, bindings: pd.DataFrame
+) -> pd.DataFrame:
+    """Combine the DAX scan with report usage into a real delete verdict.
+
+    On its own the DAX scan can only say "nothing in the model references
+    this", which is why the Unused Objects view is careful to call that a
+    lead rather than a verdict. A column dropped straight onto a bar chart
+    axis is invisible to it. With the .pbix in hand the two blind spots cancel
+    out, and a column that neither DAX nor any visual touches can honestly be
+    called safe to delete.
+    """
+    schema = ["Table", "Column", "In DAX", "In Report", "Verdict", "Severity", "Used On"]
+    if unused_df.empty:
+        return _ensure_columns(pd.DataFrame(), schema)
+
+    have_report = not bindings.empty
+    used_pages: Dict[Tuple[str, str], Set[str]] = {}
+    if have_report:
+        for _, b in bindings.iterrows():
+            key = (str(b["Table"]), str(b["Field"]))
+            used_pages.setdefault(key, set()).add(str(b["Page"]))
+    # Field names are also matched table-blind, because a visual binding whose
+    # alias couldn't be resolved still proves the *name* is in use somewhere.
+    used_names = {f for (_, f) in used_pages}
+
+    rows = []
+    for _, r in unused_df.iterrows():
+        table, col = str(r["Table"]), str(r["Column"])
+        in_dax = str(r["Status"]) != "Likely unused"
+        pages = used_pages.get((table, col), set())
+        in_report = bool(pages) or (not pages and col in used_names)
+        where = ", ".join(sorted(pages)[:6]) if pages else ("(name used, table unresolved)" if in_report else "")
+
+        if not have_report:
+            verdict, sev = ("Referenced in DAX" if in_dax else "Unknown — upload the .pbix"), "Info" if in_dax else "Low"
+        elif in_dax and in_report:
+            verdict, sev = "Keep — used in DAX and on report visuals", "Info"
+        elif in_dax:
+            verdict, sev = "Keep — used in DAX", "Info"
+        elif in_report:
+            verdict, sev = "Keep — used on report visuals only", "Info"
+        else:
+            verdict, sev = "Safe to delete — no DAX and no visual references it", "Medium"
+
+        rows.append({
+            "Table": table, "Column": col,
+            "In DAX": "Yes" if in_dax else "No",
+            "In Report": ("Yes" if in_report else "No") if have_report else "?",
+            "Verdict": verdict, "Severity": sev, "Used On": where,
+        })
+    return _ensure_columns(pd.DataFrame(rows), schema)
+
+
+# ==========================================================================
+# Field parameters
+# ==========================================================================
+
+def find_field_parameters(
+    model: Dict[str, Any], bindings: pd.DataFrame
+) -> pd.DataFrame:
+    """Detect field-parameter tables and whether the report actually uses them.
+
+    A field parameter is a disconnected calculated table whose rows are
+    NAMEOF() references to other fields, marked up with a `ParameterMetadata`
+    extended property. They're easy to create, easy to forget, and because
+    they're disconnected nothing else in the model ever points at them - so an
+    abandoned one is invisible to every other check in this app. If no visual
+    or slicer in the report binds to it, the whole table is dead weight.
+    """
+    schema = ["Table", "Columns", "Referenced Fields", "Used In Report",
+              "Bound On", "Severity", "Verdict"]
+    rows: List[Dict[str, Any]] = []
+    have_report = not bindings.empty
+    bound_tables = set(bindings["Table"].astype(str)) if have_report else set()
+    pages_by_table: Dict[str, Set[str]] = {}
+    if have_report:
+        for _, b in bindings.iterrows():
+            pages_by_table.setdefault(str(b["Table"]), set()).add(str(b["Page"]))
+
+    # VPA carries the calculated-table expression; TOM carries the marker.
+    expr_by_table: Dict[str, str] = {}
+    tdf = model["tables"]
+    if not tdf.empty and {"TableName", "TableExpression"}.issubset(tdf.columns):
+        for _, t in tdf.iterrows():
+            expr_by_table[str(t["TableName"])] = str(t.get("TableExpression") or "")
+
+    for t in model.get("bim_tables") or []:
+        name = str(t.get("name") or "")
+        if not name:
+            continue
+        columns = [c for c in (t.get("columns") or []) if isinstance(c, dict)]
+        has_marker = any(
+            isinstance(ep, dict) and str(ep.get("name")) == "ParameterMetadata"
+            for c in columns for ep in (c.get("extendedProperties") or [])
+        )
+        expr = expr_by_table.get(name, "")
+        if not expr:
+            for p in t.get("partitions") or []:
+                src = (p or {}).get("source") if isinstance(p, dict) else None
+                if isinstance(src, dict) and str(src.get("type") or "").lower() == "calculated":
+                    expr = str(src.get("expression") or "")
+        looks_like = "NAMEOF(" in expr.upper().replace(" ", "")
+        if not has_marker and not looks_like:
+            continue
+
+        # A NAMEOF argument is always a field reference, and measure names
+        # regularly contain brackets and parentheses ("% of Total (Selected)"),
+        # so match the reference shape rather than "everything up to the next )".
+        referenced = sorted(set(re.findall(
+            r"NAMEOF\s*\(\s*('[^']+'\[[^\]]+\]|\"[^\"]+\"\[[^\]]+\]|[A-Za-z_][\w ]*\[[^\]]+\]|\[[^\]]+\])",
+            expr, flags=re.I,
+        )))
+        col_names = [str(c.get("name")) for c in columns
+                     if c.get("name") and str(c.get("type") or "").lower() != "rownumber"]
+        pages = sorted(pages_by_table.get(name, set()))
+
+        if not have_report:
+            sev, verdict = "Info", ("Field parameter table. Upload the matching .pbix to check "
+                                    "whether any slicer or visual actually uses it.")
+        elif name in bound_tables:
+            sev, verdict = "Info", f"In use on {len(pages)} page(s)."
+        else:
+            sev, verdict = "Medium", ("No visual or slicer in this report binds to it. The table, "
+                                      "its columns and its hidden sort column can all be removed.")
+        rows.append({
+            "Table": name, "Columns": ", ".join(col_names),
+            "Referenced Fields": ", ".join(referenced[:12]),
+            "Used In Report": ("Yes" if name in bound_tables else "No") if have_report else "?",
+            "Bound On": ", ".join(pages[:6]), "Severity": sev, "Verdict": verdict,
+        })
+    return sort_by_severity(_ensure_columns(pd.DataFrame(rows), schema))
+
+
+# ==========================================================================
+# Near-duplicate DAX
+# ==========================================================================
+
+_DAX_VAR_RE = re.compile(r"\bVAR\s+([A-Za-z_][A-Za-z0-9_]*)", re.I)
+
+
+def _dax_fingerprint(expr: Any) -> str:
+    """Normalise DAX down to its logic, ignoring cosmetic differences.
+
+    Beyond the whitespace and comment stripping the drift comparison does,
+    this also renames every VAR to a positional placeholder. Two developers
+    solving the same problem will pick different variable names for the same
+    intermediate value, and that difference says nothing about whether the
+    measures compute the same number.
+    """
+    s = _normalise_dax(expr)
+    names = []
+    for m in _DAX_VAR_RE.finditer(s):
+        if m.group(1) not in names:
+            names.append(m.group(1))
+    for i, name in enumerate(names):
+        s = re.sub(rf"\b{re.escape(name)}\b", f"__V{i}__", s)
+    return s.upper()   # DAX is case-insensitive
+
+
+def _tokenise_dax(fingerprint: str) -> Set[str]:
+    return set(re.findall(r"[A-Z_][A-Z0-9_]*|\[[^\]]+\]|\d+", fingerprint))
+
+
+MAX_DUPLICATE_SCAN = 1200
+
+
+def find_near_duplicate_measures(model: Dict[str, Any], threshold: int = 85) -> pd.DataFrame:
+    """Measures that compute nearly the same thing under different names.
+
+    Exact-duplicate detection misses the real-world case: someone copies a
+    certified measure, adds `+ 0` to force a zero instead of a blank, renames
+    a variable, and now the model carries two metrics that are the same number
+    99% of the time and disagree the rest. Comparison is two-stage - a cheap
+    token-overlap filter, then a character-level similarity ratio on the pairs
+    that survive - so an O(n^2) comparison stays tractable on a big model.
+    """
+    schema = ["Measure A", "Table A", "Measure B", "Table B", "Similarity %",
+              "Severity", "Verdict", "DAX A", "DAX B"]
+    meas = model["measures"]
+    if meas.empty or not {"MeasureName", "MeasureExpression"}.issubset(meas.columns):
+        return _ensure_columns(pd.DataFrame(), schema)
+
+    items: List[Tuple[str, str, str, str, Set[str]]] = []
+    for _, r in meas.dropna(subset=["MeasureName"]).iterrows():
+        expr = str(r.get("MeasureExpression") or "")
+        fp = _dax_fingerprint(expr)
+        if len(fp) < 8:      # trivial constants aren't interesting duplicates
+            continue
+        items.append((str(r["MeasureName"]), str(r.get("TableName") or ""), expr, fp, _tokenise_dax(fp)))
+        if len(items) >= MAX_DUPLICATE_SCAN:
+            break
+
+    rows: List[Dict[str, Any]] = []
+    for i in range(len(items)):
+        name_a, table_a, expr_a, fp_a, tok_a = items[i]
+        for j in range(i + 1, len(items)):
+            name_b, table_b, expr_b, fp_b, tok_b = items[j]
+            if not tok_a or not tok_b:
+                continue
+            # Cheap gate first: length ratio, then Jaccard on tokens.
+            shorter, longer = sorted((len(fp_a), len(fp_b)))
+            if longer and shorter / longer < threshold / 100 * 0.8:
+                continue
+            jaccard = len(tok_a & tok_b) / len(tok_a | tok_b)
+            if jaccard * 100 < threshold * 0.75:
+                continue
+            ratio = difflib.SequenceMatcher(None, fp_a, fp_b).ratio() * 100
+            if ratio < threshold:
+                continue
+            if ratio >= 99.9:
+                sev, verdict = "High", ("Identical logic under two names. One of these should be "
+                                        "deleted and its references repointed.")
+            elif ratio >= 95:
+                sev, verdict = "High", ("Near-identical — the difference is likely a blank-handling "
+                                        "or formatting tweak. Confirm they're meant to differ.")
+            else:
+                sev, verdict = "Medium", ("Substantially similar. Check whether one can be expressed "
+                                          "in terms of the other rather than duplicated.")
+            rows.append({
+                "Measure A": name_a, "Table A": table_a,
+                "Measure B": name_b, "Table B": table_b,
+                "Similarity %": round(ratio, 1), "Severity": sev, "Verdict": verdict,
+                "DAX A": expr_a, "DAX B": expr_b,
+            })
+
+    df = _ensure_columns(pd.DataFrame(rows), schema)
+    if df.empty:
+        return df
+    return sort_by_severity(df.sort_values("Similarity %", ascending=False)).reset_index(drop=True)
+
+
+# ==========================================================================
+# Source-system lineage from Power Query SQL
+# ==========================================================================
+
+try:                                    # optional - improves accuracy a lot
+    import sqlglot as _sqlglot
+    from sqlglot import exp as _sqlglot_exp
+except Exception:                       # noqa: BLE001 - any import problem degrades gracefully
+    _sqlglot = None
+    _sqlglot_exp = None
+
+SQL_DIALECTS = ["(auto-detect)", "tsql", "snowflake", "databricks", "bigquery",
+                "postgres", "oracle", "mysql", "redshift", "hive", "spark"]
+
+_SQL_TABLE_RE = re.compile(
+    r"\b(?:FROM|JOIN)\s+([\[\]\"`\w.]+(?:\s*\.\s*[\[\]\"`\w]+){0,3})", re.I
+)
+
+
+def _clean_sql_identifier(raw: str) -> str:
+    return raw.strip().strip("[]\"`").strip()
+
+
+def _sql_sources(sql: str, dialect: Optional[str] = None) -> List[Tuple[str, str, str]]:
+    """(database, schema, table) for every table a SELECT reads.
+
+    Uses sqlglot when it's installed, which correctly ignores CTE names,
+    subquery aliases and table-valued functions. Without it, falls back to a
+    FROM/JOIN regex - less precise, but it keeps this feature working rather
+    than disappearing when the optional dependency is missing.
+    """
+    sql = (sql or "").strip()
+    if not sql:
+        return []
+
+    if _sqlglot is not None and _sqlglot_exp is not None:
+        try:
+            parsed = _sqlglot.parse(sql, read=dialect or None)
+        except Exception:                # noqa: BLE001 - fall through to regex
+            parsed = None
+        if parsed:
+            found: List[Tuple[str, str, str]] = []
+            for statement in parsed:
+                if statement is None:
+                    continue
+                # CTE names are not real source tables.
+                cte_names = {
+                    str(c.alias_or_name).lower()
+                    for c in statement.find_all(_sqlglot_exp.CTE)
+                }
+                for tbl in statement.find_all(_sqlglot_exp.Table):
+                    name = str(tbl.name or "")
+                    if not name or name.lower() in cte_names:
+                        continue
+                    found.append((str(tbl.catalog or ""), str(tbl.db or ""), name))
+            if found:
+                return found
+
+    out: List[Tuple[str, str, str]] = []
+    for match in _SQL_TABLE_RE.finditer(sql):
+        parts = [_clean_sql_identifier(p) for p in re.split(r"\s*\.\s*", match.group(1))]
+        parts = [p for p in parts if p]
+        if not parts or parts[-1].lower() in ("select", "("):
+            continue
+        db = parts[-3] if len(parts) >= 3 else ""
+        schema = parts[-2] if len(parts) >= 2 else ""
+        out.append((db, schema, parts[-1]))
+    return out
+
+
+def build_sql_lineage(model: Dict[str, Any], dialect: Optional[str] = None) -> pd.DataFrame:
+    """Map every model table back to the warehouse objects it reads.
+
+    This is the bridge between the BI side and the data-engineering side: when
+    someone proposes dropping a warehouse table, this answers "what breaks?"
+    without anyone opening Power BI Desktop.
+    """
+    schema = ["Model Table", "Partition", "Database", "Schema", "Source Table", "Full Source Name"]
+    pq = model["power_query"]
+    if pq.empty or "SQL" not in pq.columns:
+        return _ensure_columns(pd.DataFrame(), schema)
+
+    rows: List[Dict[str, str]] = []
+    for _, p in pq.iterrows():
+        sql = str(p.get("SQL") or "")
+        for db, sch, tbl in _sql_sources(sql, dialect):
+            full = ".".join([x for x in (db, sch, tbl) if x])
+            rows.append({
+                "Model Table": str(p.get("TableName") or ""),
+                "Partition": str(p.get("PartitionName") or ""),
+                "Database": db, "Schema": sch, "Source Table": tbl,
+                "Full Source Name": full,
+            })
+    df = _ensure_columns(pd.DataFrame(rows), schema)
+    return df.drop_duplicates().reset_index(drop=True)
+
+
+def build_source_impact(lineage: pd.DataFrame) -> pd.DataFrame:
+    """Reverse the lineage: which model tables break if a source is dropped."""
+    schema = ["Full Source Name", "Model Tables Affected", "Count"]
+    if lineage.empty:
+        return _ensure_columns(pd.DataFrame(), schema)
+    rows = []
+    for source, grp in lineage.groupby("Full Source Name"):
+        tables = sorted(set(grp["Model Table"].astype(str)))
+        rows.append({"Full Source Name": source,
+                     "Model Tables Affected": ", ".join(tables), "Count": len(tables)})
+    return (_ensure_columns(pd.DataFrame(rows), schema)
+            .sort_values("Count", ascending=False).reset_index(drop=True))
+
+
+def build_lineage_dot(lineage: pd.DataFrame, max_nodes: int = 60) -> str:
+    """Source-to-target diagram: warehouse objects on the left, model tables right."""
+    sources = list(dict.fromkeys(lineage["Full Source Name"].astype(str)))[:max_nodes]
+    targets = list(dict.fromkeys(lineage["Model Table"].astype(str)))[:max_nodes]
+    lines = [
+        "digraph lineage {",
+        '  graph [rankdir=LR, splines=spline, bgcolor="transparent", nodesep=.28, ranksep=1.3];',
+        '  node [shape=box, style="filled,rounded", fontname="Helvetica", fontsize=10];',
+        '  edge [color="#94a3b8", arrowsize=.7];',
+        "  { rank=same;",
+    ]
+    for s in sources:
+        lines.append(f'    {_dot_id("src::" + s)} [label={_dot_id(s)}, fillcolor="#e8f1fb", '
+                     f'color="#2d6ca8", fontcolor="#1f3a5f"];')
+    lines.append("  }")
+    lines.append("  { rank=same;")
+    for t in targets:
+        lines.append(f'    {_dot_id("tgt::" + t)} [label={_dot_id(t)}, fillcolor="#ffffff", '
+                     f'color="#94a3b8", fontcolor="#1e293b"];')
+    lines.append("  }")
+    seen: Set[Tuple[str, str]] = set()
+    for _, r in lineage.iterrows():
+        s, t = str(r["Full Source Name"]), str(r["Model Table"])
+        if s not in sources or t not in targets or (s, t) in seen:
+            continue
+        seen.add((s, t))
+        lines.append(f'  {_dot_id("src::" + s)} -> {_dot_id("tgt::" + t)};')
+    lines.append("}")
+    return "\n".join(lines)
+
+
+# ==========================================================================
+# Model cleanup: delete script + cleaned Model.bim
+# ==========================================================================
+
+def build_cleanup_plan(
+    disposition: pd.DataFrame,
+    field_params: pd.DataFrame,
+    include_columns: bool = True,
+    include_field_params: bool = True,
+) -> Dict[str, Any]:
+    """What a cleanup would actually remove, as concrete object lists."""
+    columns: List[Tuple[str, str]] = []
+    if include_columns and not disposition.empty and "Verdict" in disposition.columns:
+        safe = disposition[disposition["Verdict"].astype(str).str.startswith("Safe to delete")]
+        columns = [(str(r["Table"]), str(r["Column"])) for _, r in safe.iterrows()]
+    tables: List[str] = []
+    if include_field_params and not field_params.empty and "Used In Report" in field_params.columns:
+        dead = field_params[field_params["Used In Report"] == "No"]
+        tables = [str(r["Table"]) for _, r in dead.iterrows()]
+    # A column on a table that's being dropped entirely is redundant noise.
+    columns = [(t, c) for t, c in columns if t not in set(tables)]
+    return {"columns": columns, "tables": tables}
+
+
+def build_cleanup_csharp(model: Dict[str, Any], plan: Dict[str, Any]) -> str:
+    """Tabular Editor script that performs the deletions in the plan."""
+    lines = [
+        "// =====================================================================",
+        "// Model cleanup — generated by VPAX Semantic Model Explorer",
+        f"// Model: {model.get('model_name') or '(unnamed)'}",
+        "//",
+        "// These objects are referenced by no DAX in the model AND no visual in",
+        "// the .pbix that was analysed alongside it.",
+        "//",
+        "// STILL CHECK, BEFORE YOU RUN THIS:",
+        "//   * other reports built on this same semantic model — one .pbix",
+        "//     cannot speak for all of them;",
+        "//   * paginated reports, Excel Analyze-in-Excel and XMLA clients;",
+        "//   * anything assembled dynamically at query time.",
+        "// Run against a copy, and keep the original .pbix until you've verified.",
+        "// =====================================================================",
+        "",
+    ]
+    if plan["tables"]:
+        lines.append("// --- Field parameter tables with no report binding ---")
+        for t in plan["tables"]:
+            lines.append(f"Model.Tables[{_cs_string(t)}].Delete();")
+        lines.append("")
+    if plan["columns"]:
+        lines.append("// --- Columns unused in both DAX and visuals ---")
+        for table, col in plan["columns"]:
+            lines.append(f"Model.Tables[{_cs_string(table)}].Columns[{_cs_string(col)}].Delete();")
+        lines.append("")
+    if not plan["tables"] and not plan["columns"]:
+        lines.append("// Nothing selected for removal.")
+    else:
+        total = len(plan["tables"]) + len(plan["columns"])
+        lines.append(f'Info("Removed {total} object(s). Review, then Save to the model.");')
+    return "\n".join(lines)
+
+
+def build_cleanup_tmdl(plan: Dict[str, Any]) -> str:
+    """The same plan expressed as TMDL, for a definition-file workflow."""
+    lines = [
+        "/// Model cleanup — generated by VPAX Semantic Model Explorer.",
+        "/// TMDL describes what a model *should* contain, so a deletion is",
+        "/// applied by removing these blocks from the .tmdl files under",
+        "/// definition/tables/ and re-deploying — there is no delete verb.",
+        "/// Each entry below gives the file and the block to remove.",
+        "",
+    ]
+    if plan["tables"]:
+        lines.append("// Whole tables — delete the file outright:")
+        for t in plan["tables"]:
+            lines.append(f"//   definition/tables/{t}.tmdl")
+        lines.append("")
+    if plan["columns"]:
+        lines.append("// Columns — remove these blocks from their table files:")
+        by_table: Dict[str, List[str]] = {}
+        for table, col in plan["columns"]:
+            by_table.setdefault(table, []).append(col)
+        for table in sorted(by_table):
+            lines.append(f"\n// --- definition/tables/{table}.tmdl ---")
+            for col in sorted(by_table[table]):
+                lines.append(f"\tcolumn '{col}'")
+    if not plan["tables"] and not plan["columns"]:
+        lines.append("// Nothing selected for removal.")
+    return "\n".join(lines)
+
+
+def build_cleaned_bim(model: Dict[str, Any], plan: Dict[str, Any]) -> bytes:
+    """A Model.bim with the planned objects physically stripped out.
+
+    Relationships that pointed at a removed column go too — leaving them
+    behind produces a definition that won't deploy.
+    """
+    import copy
+
+    bim = copy.deepcopy(model.get("bim") or {})
+    m = bim.get("model")
+    if not isinstance(m, dict):
+        raise ValueError("This .vpax has no usable Model.bim to rewrite.")
+
+    drop_tables = set(plan["tables"])
+    drop_cols: Dict[str, Set[str]] = {}
+    for table, col in plan["columns"]:
+        drop_cols.setdefault(table, set()).add(col)
+
+    tables = [t for t in (m.get("tables") or [])
+              if not (isinstance(t, dict) and str(t.get("name")) in drop_tables)]
+    for t in tables:
+        if not isinstance(t, dict):
+            continue
+        gone = drop_cols.get(str(t.get("name")), set())
+        if gone:
+            t["columns"] = [c for c in (t.get("columns") or [])
+                            if not (isinstance(c, dict) and str(c.get("name")) in gone)]
+    m["tables"] = tables
+
+    def rel_ok(r: Any) -> bool:
+        if not isinstance(r, dict):
+            return False
+        for tkey, ckey in (("fromTable", "fromColumn"), ("toTable", "toColumn")):
+            table = str(r.get(tkey) or "")
+            if table in drop_tables:
+                return False
+            if str(r.get(ckey) or "") in drop_cols.get(table, set()):
+                return False
+        return True
+
+    if isinstance(m.get("relationships"), list):
+        m["relationships"] = [r for r in m["relationships"] if rel_ok(r)]
+
+    return json.dumps(bim, indent=2, default=str).encode("utf-8")
+
+
+# ==========================================================================
 # Rendering helpers
 # ==========================================================================
 
@@ -3691,7 +4526,7 @@ def tab_guard(tab_name: str):
 # guarantees the scorecard can never disagree with the tab it links to.
 
 @st.cache_data(show_spinner=False)
-def compute_all_findings(file_bytes: bytes) -> Dict[str, Any]:
+def compute_all_findings(file_bytes: bytes, duplicate_threshold: int = 85) -> Dict[str, Any]:
     m = load_model(file_bytes)
     graph = build_measure_graph(m)
     taxonomy_tree, taxonomy_issues = build_taxonomy(m)
@@ -3709,14 +4544,43 @@ def compute_all_findings(file_bytes: bytes) -> Dict[str, Any]:
         "measure_graph": graph,
         "cycles": find_cycles(graph),
         "size": build_model_size_summary(m),
+        "duplicates": find_near_duplicate_measures(m, duplicate_threshold),
+    }
+
+
+@st.cache_data(show_spinner=False)
+def compute_report_findings(
+    file_bytes: bytes, pbix_bytes: Optional[bytes], unused_df: pd.DataFrame
+) -> Dict[str, Any]:
+    """Checks that need the model and the report together.
+
+    Kept separate from the model-only scan so uploading a .pbix doesn't
+    invalidate the (much more expensive) model cache, and so every one of
+    these degrades to a clear "upload the .pbix" state rather than an error
+    when the report isn't there.
+    """
+    m = load_model(file_bytes)
+    rep = load_report_pages(pbix_bytes) if pbix_bytes else None
+    bindings = _report_bindings(rep)
+    return {
+        "bindings": bindings,
+        "broken": validate_report_bindings(bindings, m),
+        "disposition": classify_column_disposition(m, unused_df, bindings),
+        "field_params": find_field_parameters(m, bindings),
     }
 
 
 with st.status("Scanning the model…", expanded=False) as _scan_status:
     findings = compute_all_findings(source_bytes)
+    report_findings = compute_report_findings(
+        source_bytes, pbix_file.getvalue() if pbix_file is not None else None,
+        findings["unused"],
+    )
     _scan_status.update(
         label=f"Scanned {len(model['all_table_names'])} tables, "
-              f"{len(model['measures'])} measures",
+              f"{len(model['measures'])} measures"
+              + (f", {len(report_findings['bindings'])} report field bindings"
+                 if not report_findings["bindings"].empty else ""),
         state="complete",
     )
 
@@ -3729,6 +4593,12 @@ taxonomy_tree = findings["taxonomy_tree"]
 taxonomy_issues = findings["taxonomy_issues"]
 rls_sim_df = findings["rls_sim"]
 rls_summary_df = findings["rls_summary"]
+duplicates_df = findings["duplicates"]
+bindings_df = report_findings["bindings"]
+broken_df = report_findings["broken"]
+disposition_df = report_findings["disposition"]
+field_params_df = report_findings["field_params"]
+has_report = not bindings_df.empty
 
 
 # ==========================================================================
@@ -3745,12 +4615,15 @@ NAV_GROUPS: Dict[str, List[str]] = {
         "Display Folders",
     ],
     "🩺 Audit": [
-        "Model Health", "Naming Conventions", "Unused Objects", "Date Table Check",
+        "Model Health", "Naming Conventions", "Unused Objects", "Report Usage",
+        "Duplicate Measures", "Field Parameters", "Date Table Check",
         "Model Size", "Compression Advisor", "Fabric Readiness",
     ],
-    "🔬 Investigate": ["Impact Analysis", "Measure Dependencies", "Model Compare"],
+    "🔬 Investigate": [
+        "Impact Analysis", "Measure Dependencies", "Source Lineage", "Model Compare",
+    ],
     "🛡️ Govern": [
-        "Security & Perspectives", "RLS Simulator", "Fix Script (C#)",
+        "Security & Perspectives", "RLS Simulator", "Fix Script (C#)", "Model Cleanup",
         "Data Dictionary Export", "Theme",
     ],
 }
@@ -3765,6 +4638,12 @@ PAGE_FINDINGS: Dict[str, Tuple[str, pd.DataFrame, str]] = {
     "Fabric Readiness": ("Direct Lake blockers", fabric_df, "Severity"),
     "Display Folders": ("Taxonomy gaps", taxonomy_issues, "Severity"),
     "RLS Simulator": ("Roles with unsecured tables", rls_summary_df, "Severity"),
+    "Report Usage": ("Broken visuals & deletable columns",
+                     pd.concat([broken_df[["Severity"]], disposition_df[["Severity"]]],
+                               ignore_index=True) if has_report else pd.DataFrame(),
+                     "Severity"),
+    "Duplicate Measures": ("Near-identical DAX", duplicates_df, "Severity"),
+    "Field Parameters": ("Abandoned parameter tables", field_params_df, "Severity"),
 }
 
 
@@ -4489,11 +5368,22 @@ if nav_page == "Unused Objects":
                 st.success("Every column is referenced somewhere in the model.", icon="✅")
             else:
                 show_table(view, "Unused Columns", height=460, key="unused")
-                st.caption(
-                    "Before removing any of these, confirm in **Investigate ➜ Impact Analysis** "
-                    "and check the live report — a column used only on a visual axis looks "
-                    "unused to a metadata-only scan."
-                )
+                if has_report:
+                    rescued = int((disposition_df["Verdict"] == "Keep — used on report visuals only").sum())
+                    safe_n = int(disposition_df["Verdict"].astype(str).str.startswith("Safe to delete").sum())
+                    st.success(
+                        f"The .pbix is loaded, so this list has been checked against the report: "
+                        f"**{rescued}** of these are used on a visual after all, and **{safe_n}** "
+                        "are genuinely safe to delete. See **Audit ➜ Report Usage** for the verdict "
+                        "per column.", icon="🖥️",
+                    )
+                else:
+                    st.caption(
+                        "Before removing any of these, confirm in **Investigate ➜ Impact Analysis** "
+                        "— and upload the matching **.pbix** to turn \"likely unused\" into a real "
+                        "verdict. A column used only on a visual axis looks completely unused to a "
+                        "DAX-only scan."
+                    )
 
 # --- Impact Analysis ---------------------------------------------------------
 if nav_page == "Impact Analysis":
@@ -4699,6 +5589,12 @@ if nav_page == "Data Dictionary Export":
                     ("Fabric Readiness", fabric_df),
                     ("Taxonomy Issues", taxonomy_issues),
                     ("RLS Exposure", rls_summary_df),
+                    ("Near-Duplicate Measures", duplicates_df.drop(columns=["DAX A", "DAX B"],
+                                                                   errors="ignore")),
+                    ("Field Parameters", field_params_df),
+                    ("Broken Visuals", broken_df),
+                    ("Column Disposition", disposition_df),
+                    ("Source Lineage", build_sql_lineage(model)),
                 ],
             )
             st.download_button(
@@ -5063,6 +5959,303 @@ if nav_page == "Fix Script (C#)":
             "anything you're about to rename. Tabular Editor writes changes straight to the "
             "model — there's no undo once saved.", icon="⚠️",
         )
+
+# --- Report Usage -------------------------------------------------------------
+if nav_page == "Report Usage":
+    with tab_guard("Report Usage"):
+        st.subheader("Broken visuals & true delete safety")
+        st.caption(
+            "The .vpax says what the model contains; the .pbix says what the report asks "
+            "for. Comparing them catches both directions — visuals bound to objects that "
+            "no longer exist, and columns that genuinely nothing uses."
+        )
+        if not has_report:
+            st.info(
+                "👈 Upload the matching **.pbix** in the sidebar (*Add report pages*). "
+                "Without it, the Unused Objects scan can only see DAX — a column dropped "
+                "straight onto a chart axis is invisible to it, which is why it says "
+                "\"likely unused\" rather than \"safe to delete\".",
+                icon="🖥️",
+            )
+        else:
+            k = st.columns(4)
+            safe_n = int(disposition_df["Verdict"].astype(str).str.startswith("Safe to delete").sum())
+            visual_only = int((disposition_df["Verdict"] == "Keep — used on report visuals only").sum())
+            k[0].metric("🔴 Broken bindings", len(broken_df),
+                        help="Visuals pointing at a table, column or measure that isn't in the model.")
+            k[1].metric("🟠 Safe to delete", safe_n,
+                        help="Referenced by no DAX and no visual in this report.")
+            k[2].metric("Rescued from 'unused'", visual_only,
+                        help="Flagged unused by the DAX scan, but actually used on a visual.")
+            k[3].metric("Field bindings read", len(bindings_df))
+
+            st.markdown("#### 🔴 Broken visuals")
+            if broken_df.empty:
+                st.success("Every field every visual asks for exists in the model.", icon="✅")
+            else:
+                st.error(
+                    f"{len(broken_df)} binding(s) reference objects this model doesn't have. "
+                    "These visuals will error or render blank when someone opens the page.",
+                    icon="🔴",
+                )
+                show_table(broken_df, "Broken Visuals", height=320, key="broken_visuals")
+
+            st.markdown("#### Delete safety per column")
+            hide_kept = st.checkbox("Show only columns safe to delete", value=True, key="disp_only_safe")
+            view = (disposition_df[disposition_df["Verdict"].astype(str).str.startswith("Safe to delete")]
+                    if hide_kept else disposition_df)
+            if view.empty:
+                st.success("Nothing is safe to delete — every column earns its place.", icon="✅")
+            else:
+                show_table(view, "Column Disposition", height=400, key="disposition")
+            st.warning(
+                "**One .pbix speaks for one report.** If other reports, paginated reports, "
+                "Excel workbooks or XMLA clients connect to this same semantic model, they "
+                "can use columns this analysis sees as unused. Verify before deleting.",
+                icon="⚠️",
+            )
+
+            with st.expander(f"All {len(bindings_df)} field bindings read from the report"):
+                show_table(bindings_df, "Report Bindings", height=360, key="bindings")
+
+# --- Duplicate Measures -------------------------------------------------------
+if nav_page == "Duplicate Measures":
+    with tab_guard("Duplicate Measures"):
+        st.subheader("Near-duplicate measures")
+        st.caption(
+            "Exact-string matching misses how redundancy actually happens: someone copies a "
+            "certified measure, adds `+ 0` to force a zero instead of a blank, renames a "
+            "variable, and now two metrics disagree in exactly the cases nobody tests. "
+            "Comparison strips comments, whitespace, casing and VAR names first, so only "
+            "genuine logic differences count."
+        )
+        thr = st.slider(
+            "Similarity threshold (%)", min_value=70, max_value=100, value=85, step=5,
+            key="dup_threshold",
+            help="Lower catches more candidates but adds false positives. 95%+ is usually "
+                 "a copy-paste; 80–90% often means one measure could be built from the other.",
+        )
+        dupes = findings["duplicates"] if thr == 85 else find_near_duplicate_measures(model, thr)
+        if dupes.empty:
+            st.success(
+                f"No measure pairs are {thr}% or more alike. Nothing to consolidate.", icon="✅",
+            )
+        else:
+            counts = severity_counts(dupes)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("🔴 Very close (95%+)", counts.get("High", 0))
+            c2.metric("🟠 Similar", counts.get("Medium", 0))
+            c3.metric("Pairs found", len(dupes))
+            show_table(
+                dupes[["Measure A", "Table A", "Measure B", "Table B", "Similarity %",
+                       "Severity", "Verdict"]],
+                "Near-Duplicate Measures", height=340, key="dupes",
+            )
+            labels = [f"{r['Measure A']}  ↔  {r['Measure B']}  ({r['Similarity %']}%)"
+                      for _, r in dupes.iterrows()]
+            pick = st.selectbox("Compare the DAX side by side", labels, key="dup_pick")
+            row = dupes.iloc[labels.index(pick)]
+            d1, d2 = st.columns(2)
+            with d1:
+                st.markdown(f"**{row['Measure A']}** — `{row['Table A']}`")
+                st.code(row["DAX A"] or "(empty)", language="dax")
+            with d2:
+                st.markdown(f"**{row['Measure B']}** — `{row['Table B']}`")
+                st.code(row["DAX B"] or "(empty)", language="dax")
+            st.caption(
+                "Before consolidating, run both names through **Investigate ➜ Impact Analysis** "
+                "— the one that looks redundant may be the one every report actually uses."
+            )
+
+# --- Field Parameters ---------------------------------------------------------
+if nav_page == "Field Parameters":
+    with tab_guard("Field Parameters"):
+        st.subheader("Field parameter tables")
+        st.caption(
+            "Field parameters are disconnected calculated tables whose rows are `NAMEOF()` "
+            "references to other fields. Because nothing in the model points at them, an "
+            "abandoned one is invisible to every other check here — no relationship, no "
+            "measure and no calculated column will ever mention it."
+        )
+        if field_params_df.empty:
+            st.info("No field parameter tables found in this model.")
+        else:
+            counts = severity_counts(field_params_df)
+            c1, c2 = st.columns(2)
+            c1.metric("Field parameter tables", len(field_params_df))
+            c2.metric("🟠 Unused in this report", counts.get("Medium", 0))
+            if not has_report:
+                st.info(
+                    "👈 Upload the matching **.pbix** to check which of these a slicer or "
+                    "visual actually binds to. Without it, they can only be listed.",
+                    icon="🖥️",
+                )
+            show_table(field_params_df, "Field Parameters", height=360, key="field_params")
+            st.caption(
+                "Removing an unused one takes the table, its visible label column, its hidden "
+                "field column and its sort-order column with it — **Govern ➜ Model Cleanup** "
+                "generates that deletion."
+            )
+
+# --- Source Lineage -----------------------------------------------------------
+if nav_page == "Source Lineage":
+    with tab_guard("Source Lineage"):
+        st.subheader("Source-system lineage")
+        st.caption(
+            "Parses the `SELECT` statements behind each table's Power Query step to work out "
+            "which warehouse objects the model actually reads. The point is to answer the "
+            "data engineer's question — *if I deprecate this table, what breaks?* — without "
+            "anyone opening Power BI Desktop."
+        )
+        if _sqlglot is None:
+            st.warning(
+                "`sqlglot` isn't installed, so this falls back to a FROM/JOIN regex — it "
+                "will mistake CTE and subquery aliases for real tables. Run "
+                "`pip install sqlglot` for accurate parsing.",
+                icon="⚠️",
+            )
+        dialect_label = st.selectbox(
+            "SQL dialect", SQL_DIALECTS, key="lineage_dialect",
+            help="Auto-detect works for most standard SQL. Pick the specific dialect if your "
+                 "source uses vendor syntax (T-SQL square brackets, Snowflake semi-structured "
+                 "access, and so on).",
+        )
+        dialect = None if dialect_label.startswith("(") else dialect_label
+        lineage = build_sql_lineage(model, dialect)
+
+        if lineage.empty:
+            st.info(
+                "No SQL source tables could be resolved. This model's tables may load from "
+                "a non-SQL source (files, OData, a dataflow), use native M transforms with "
+                "no SELECT, or connect via DirectQuery navigation rather than a query."
+            )
+        else:
+            impact = build_source_impact(lineage)
+            k = st.columns(3)
+            k[0].metric("Source tables", lineage["Full Source Name"].nunique())
+            k[1].metric("Model tables mapped", lineage["Model Table"].nunique())
+            k[2].metric("Distinct schemas", lineage["Schema"].replace("", pd.NA).nunique())
+
+            st.markdown("#### If a source table is dropped, these break")
+            show_table(impact, "Source Impact", height=280, key="source_impact")
+
+            st.markdown("#### Source ➜ model mapping")
+            show_table(lineage, "Source Lineage", height=320, key="lineage")
+
+            with st.expander("Show as a diagram", expanded=False):
+                static_diagram_panel(build_lineage_dot(lineage), engine="dot", filename="source_lineage")
+
+# --- Model Cleanup ------------------------------------------------------------
+if nav_page == "Model Cleanup":
+    with tab_guard("Model Cleanup"):
+        st.subheader("Clean model export")
+        st.caption(
+            "Turns the delete-safe findings into something you can actually run, instead of "
+            "a list somebody works through by hand. Only objects that no DAX **and** no "
+            "visual references are ever included."
+        )
+        if not has_report:
+            st.error(
+                "This section needs the matching **.pbix**. Deleting columns on the strength "
+                "of a DAX-only scan is how reports get broken — a column used on a chart axis "
+                "and nowhere else looks completely unused from the model side.",
+                icon="🛑",
+            )
+        else:
+            opt = st.columns(2)
+            with opt[0]:
+                inc_cols = st.checkbox(
+                    "Columns unused in DAX and visuals", True, key="cl_cols",
+                )
+            with opt[1]:
+                inc_fp = st.checkbox(
+                    "Field parameter tables with no report binding", True, key="cl_fp",
+                )
+            plan = build_cleanup_plan(disposition_df, field_params_df, inc_cols, inc_fp)
+            n_cols, n_tables = len(plan["columns"]), len(plan["tables"])
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Columns to remove", n_cols)
+            m2.metric("Tables to remove", n_tables)
+            saved = 0.0
+            cols_meta = _user_facing_columns(model["columns"])
+            if n_cols and "TotalSize" in cols_meta.columns:
+                targets = set(plan["columns"])
+                for _, c in cols_meta.iterrows():
+                    if (str(c.get("TableName")), str(c.get("ColumnName"))) in targets:
+                        saved += pd.to_numeric(pd.Series([c.get("TotalSize")]),
+                                               errors="coerce").fillna(0).iloc[0]
+            m3.metric("Memory reclaimed", f"{_bytes_to_mb(saved):.1f} MB" if saved else "—")
+
+            if not n_cols and not n_tables:
+                st.success(
+                    "Nothing qualifies for removal — every object is referenced by DAX or by "
+                    "a visual in this report.", icon="✅",
+                )
+            else:
+                with st.expander(f"Review what would be removed ({n_cols + n_tables} object(s))",
+                                 expanded=True):
+                    if plan["tables"]:
+                        st.markdown("**Tables**")
+                        st.write(plan["tables"])
+                    if plan["columns"]:
+                        st.markdown("**Columns**")
+                        show_table(
+                            pd.DataFrame(plan["columns"], columns=["Table", "Column"]),
+                            "Cleanup Columns", height=260, key="cleanup_cols",
+                        )
+
+                fmt = st.radio(
+                    "Output format", ["Tabular Editor C#", "TMDL notes", "Cleaned Model.bim"],
+                    horizontal=True, key="cleanup_fmt",
+                    help="C# runs the deletions directly. TMDL notes tell you which blocks to "
+                         "remove from a source-controlled definition. Model.bim is the "
+                         "rewritten definition itself.",
+                )
+                slug = _slug(model.get("model_name") or "model")
+                if fmt == "Tabular Editor C#":
+                    script = build_cleanup_csharp(model, plan)
+                    st.code(script, language="csharp")
+                    st.download_button(
+                        "⬇ Download cleanup script (.csx)", script.encode("utf-8"),
+                        file_name=f"{slug}_cleanup.csx", mime="text/plain",
+                        key="dl_cleanup_cs", width="stretch",
+                    )
+                elif fmt == "TMDL notes":
+                    tmdl = build_cleanup_tmdl(plan)
+                    st.code(tmdl, language="text")
+                    st.download_button(
+                        "⬇ Download TMDL notes (.tmdl)", tmdl.encode("utf-8"),
+                        file_name=f"{slug}_cleanup.tmdl", mime="text/plain",
+                        key="dl_cleanup_tmdl", width="stretch",
+                    )
+                else:
+                    try:
+                        cleaned = build_cleaned_bim(model, plan)
+                        st.success(
+                            f"Rewritten definition is {len(cleaned) / 1024:.0f} KB. "
+                            "Relationships that pointed at a removed column have been dropped "
+                            "too, so the definition still deploys.", icon="✅",
+                        )
+                        st.download_button(
+                            "⬇ Download cleaned Model.bim", cleaned,
+                            file_name=f"{slug}_cleaned_Model.bim", mime="application/json",
+                            key="dl_cleaned_bim", width="stretch",
+                        )
+                        st.caption(
+                            "Deploy with Tabular Editor (File ➜ Open ➜ From File, then Model ➜ "
+                            "Deploy) or via XMLA. It carries model metadata only — the report "
+                            "layer is untouched."
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"Could not rewrite the model definition: {exc}")
+
+                st.warning(
+                    "**Before you run this:** other reports on the same semantic model, "
+                    "paginated reports, Analyze-in-Excel and XMLA clients are all invisible "
+                    "to a single .pbix. Run against a copy and keep a backup.",
+                    icon="⚠️",
+                )
 
 st.markdown(
     f'<div class="app-footer">🧩 VPAX Semantic Model Explorer &nbsp;·&nbsp; <b>{AUTHOR}</b></div>',
