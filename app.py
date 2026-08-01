@@ -219,6 +219,87 @@ def inject_css() -> None:
             text-align: center; color: #64748b; font-size: .85rem;
           }
           .app-footer b { color: #2d6ca8; }
+
+          /* Navigation.
+             Both selectors are radios rather than st.tabs, because st.tabs
+             renders every tab body on every rerun and can't be switched
+             programmatically - and the scorecard's "Open ->" buttons need to
+             jump the user to a specific page. Streamlit stamps a
+             .st-key-<widget key> class on each widget's container, which is
+             the stable hook these rules attach to; the aria-label selectors
+             are a belt-and-braces fallback. */
+
+          /* Group selector (sidebar): a stacked nav list. */
+          .st-key-nav_group label,
+          div[data-testid="stRadioGroup"][aria-label="nav_group"] label {
+            background: #ffffff; border: 1px solid #dbe3ec; border-radius: 8px;
+            padding: .45rem .7rem; margin-bottom: .35rem; width: 100%;
+            transition: background .12s ease, border-color .12s ease;
+          }
+          .st-key-nav_group label:hover { border-color: #93b4d4; }
+          .st-key-nav_group label:has(input:checked),
+          div[data-testid="stRadioGroup"][aria-label="nav_group"] label:has(input:checked) {
+            background: #eaf2fb; border-color: #2d6ca8;
+          }
+          .st-key-nav_group label:has(input:checked) p { font-weight: 700; color: #1f3a5f; }
+          .st-key-nav_group div[role="radiogroup"] > label > div:first-child { display: none; }
+
+          /* Page selector (main area): a segmented control that reads like the
+             tab strip it replaced. */
+          .st-key-nav_page div[role="radiogroup"],
+          div[data-testid="stRadioGroup"][aria-label="nav_page"] {
+            display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid #e3e8ef;
+            padding-bottom: .6rem; margin-bottom: 1rem;
+          }
+          .st-key-nav_page label,
+          div[data-testid="stRadioGroup"][aria-label="nav_page"] label {
+            background: #fbfcfd; border: 1px solid #e3e8ef; border-radius: 999px;
+            padding: .3rem .85rem; font-size: .85rem; font-weight: 500; color: #64748b;
+            margin: 0;
+          }
+          .st-key-nav_page label:hover { border-color: #93b4d4; }
+          .st-key-nav_page label:has(input:checked),
+          div[data-testid="stRadioGroup"][aria-label="nav_page"] label:has(input:checked) {
+            background: #1f3a5f; border-color: #1f3a5f; color: #ffffff !important;
+            font-weight: 600;
+          }
+          .st-key-nav_page label:has(input:checked) p,
+          div[data-testid="stRadioGroup"][aria-label="nav_page"] label:has(input:checked) p {
+            color: #ffffff !important;
+          }
+          /* Hide the radio dots themselves - these read as tabs, not options. */
+          .st-key-nav_page div[role="radiogroup"] > label > div:first-child,
+          div[data-testid="stRadioGroup"][aria-label="nav_page"] > label > div:first-child {
+            display: none;
+          }
+
+          /* Scorecard */
+          .score-ring {
+            width: 108px; height: 108px; border-radius: 50%; display: flex;
+            align-items: center; justify-content: center; flex-direction: column;
+            font-weight: 800; color: #fff; margin: 0 auto;
+          }
+          .score-ring .num { font-size: 1.9rem; line-height: 1; }
+          .score-ring .lbl { font-size: .62rem; letter-spacing: .5px; text-transform: uppercase; opacity: .85; }
+          .issue-card {
+            background: #ffffff; border: 1px solid #dbe3ec; border-left: 5px solid #94a3b8;
+            border-radius: 10px; padding: .8rem 1rem; margin-bottom: .6rem;
+            box-shadow: 0 1px 3px rgba(16,24,40,.05);
+          }
+          .issue-card.sev-High { border-left-color: #dc2626; }
+          .issue-card.sev-Medium { border-left-color: #d97706; }
+          .issue-card.sev-Low { border-left-color: #64748b; }
+          .issue-card.sev-Clean { border-left-color: #16a34a; }
+          .issue-card .title { font-weight: 700; color: #1e293b; font-size: .95rem; }
+          .issue-card .desc { color: #64748b; font-size: .82rem; margin-top: .15rem; }
+          .badge-pill {
+            display:inline-block; padding: .05rem .55rem; border-radius: 999px;
+            font-size: .72rem; font-weight: 700; margin-left: .4rem;
+          }
+          .badge-pill.High { background:#fee2e2; color:#991b1b; }
+          .badge-pill.Medium { background:#fef3c7; color:#92400e; }
+          .badge-pill.Low { background:#e2e8f0; color:#475569; }
+          .badge-pill.Clean { background:#dcfce7; color:#166534; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -755,7 +836,8 @@ def load_model(file_bytes: bytes) -> Dict[str, Any]:
     measures_df = _records("Measures")
     if not measures_df.empty:
         measures_df = measures_df[
-            [c for c in ("TableName", "MeasureName", "MeasureExpression", "DataType", "FormatString", "Description")
+            [c for c in ("TableName", "MeasureName", "MeasureExpression", "DataType",
+                         "FormatString", "Description", "DisplayFolder")
              if c in measures_df.columns]
         ]
     measures_df = _ensure_columns(measures_df, ["TableName", "MeasureName", "MeasureExpression"])
@@ -834,7 +916,153 @@ def load_model(file_bytes: bytes) -> Dict[str, Any]:
         "date_tables": _build_date_tables(bim_tables),
         "roles": _build_roles(bim, all_table_names),
         "perspectives": _build_perspectives(bim),
+        # Raw TOM kept so the newer modules (Fabric readiness, display-folder
+        # taxonomy, model compare) can read properties VPA never exposes -
+        # isHidden, displayFolder, partition mode, hierarchies, lineage tags.
+        "bim_tables": bim_tables,
+        # Physical storage detail, used by the compression advisor. Present in
+        # DAX Studio exports; absent in some Tabular Editor ones, hence the
+        # tolerant _records() reader and the .empty checks downstream.
+        "segments": _records("ColumnsSegments"),
+        "col_hierarchies": _records("ColumnsHierarchies"),
+        "user_hierarchies": _records("UserHierarchies"),
     }
+
+
+@lru_cache(maxsize=1)
+def build_sample_vpax_bytes() -> bytes:
+    """A small, self-contained star-schema model for the "try a sample" button.
+
+    New users shouldn't need to go export a real .vpax before they can see
+    what this app does. This model is deliberately a little imperfect (a
+    bi-directional relationship, an unused column, an inconsistent measure
+    name, a missing description) so every audit tab - Model Health, Naming
+    Conventions, Unused Objects - has something real to show, not just an
+    empty "all clear".
+    """
+    bim = {
+        "model": {
+            "tables": [
+                {
+                    "name": "Date", "dataCategory": "Time",
+                    "columns": [
+                        {"name": "DateKey", "dataType": "int64", "isKey": True},
+                        {"name": "Date", "dataType": "dateTime"},
+                        {"name": "Year", "dataType": "int64"},
+                        {"name": "Month", "dataType": "string"},
+                    ],
+                    "measures": [],
+                    "partitions": [{"name": "Date", "mode": "import",
+                                    "source": {"type": "m", "expression": 'let\n  q = "SELECT * FROM dim_date"\nin\n  q'}}],
+                },
+                {
+                    "name": "Product",
+                    "columns": [
+                        {"name": "ProductKey", "dataType": "int64", "isKey": True},
+                        {"name": "Product Name", "dataType": "string"},
+                        {"name": "Category", "dataType": "string"},
+                    ],
+                    "measures": [],
+                    "partitions": [{"name": "Product", "mode": "import",
+                                    "source": {"type": "m", "expression": 'let\n  q = "SELECT * FROM dim_product"\nin\n  q'}}],
+                },
+                {
+                    "name": "Customer",
+                    "columns": [
+                        {"name": "CustomerKey", "dataType": "int64", "isKey": True},
+                        {"name": "Customer Name", "dataType": "string"},
+                        {"name": "Region", "dataType": "string"},
+                        # Deliberately unreferenced - the sample lets Unused
+                        # Objects show a real finding on first use.
+                        {"name": "internal_notes", "dataType": "string"},
+                    ],
+                    "measures": [],
+                    "partitions": [{"name": "Customer", "mode": "import",
+                                    "source": {"type": "m", "expression": 'let\n  q = "SELECT * FROM dim_customer"\nin\n  q'}}],
+                },
+                {
+                    "name": "Sales",
+                    "columns": [
+                        {"name": "DateKey", "dataType": "int64"},
+                        {"name": "ProductKey", "dataType": "int64"},
+                        {"name": "CustomerKey", "dataType": "int64"},
+                        {"name": "Quantity", "dataType": "int64"},
+                        {"name": "Unit Price", "dataType": "double"},
+                    ],
+                    "measures": [
+                        {"name": "Total Sales", "expression": "SUMX(Sales, Sales[Quantity] * Sales[Unit Price])"},
+                        {"name": "Total Quantity", "expression": "SUM(Sales[Quantity])"},
+                        {"name": "Sales YTD", "expression": "TOTALYTD([Total Sales], 'Date'[Date])"},
+                        # Inconsistent casing on purpose, for Naming Conventions.
+                        {"name": "total_orders", "expression": "COUNTROWS(Sales)"},
+                    ],
+                    "partitions": [{"name": "Sales", "mode": "import",
+                                    "source": {"type": "m", "expression": 'let\n  q = "SELECT * FROM fact_sales"\nin\n  q'}}],
+                },
+            ],
+            "relationships": [
+                {"name": "r1", "fromTable": "Sales", "fromColumn": "DateKey",
+                 "toTable": "Date", "toColumn": "DateKey", "crossFilteringBehavior": "singleDirection",
+                 "isActive": True, "fromCardinality": "many", "toCardinality": "one"},
+                {"name": "r2", "fromTable": "Sales", "fromColumn": "ProductKey",
+                 "toTable": "Product", "toColumn": "ProductKey", "crossFilteringBehavior": "singleDirection",
+                 "isActive": True, "fromCardinality": "many", "toCardinality": "one"},
+                # Bi-directional on purpose, for Model Health.
+                {"name": "r3", "fromTable": "Sales", "fromColumn": "CustomerKey",
+                 "toTable": "Customer", "toColumn": "CustomerKey", "crossFilteringBehavior": "both",
+                 "isActive": True, "fromCardinality": "many", "toCardinality": "one"},
+            ],
+            "roles": [
+                # Secures a dimension - the textbook-correct pattern. The
+                # filter flows down to Sales.
+                {"name": "Regional Manager",
+                 "tablePermissions": [{"name": "Customer", "filterExpression": "Customer[Region] = \"West\""}]},
+                # Secures the fact instead. Looks configured, but the filter
+                # can't travel back up to the dimensions - exactly the trapped-
+                # filter case the RLS simulator exists to catch.
+                {"name": "Sales Rep (misconfigured)",
+                 "tablePermissions": [{"name": "Sales", "filterExpression": "Sales[Quantity] > 0"}]},
+            ],
+        },
+    }
+    # Folders on three of the four measures, so the taxonomy view shows both a
+    # real folder structure and one measure that fell out of it.
+    measure_folders = {"Total Sales": "Sales", "Total Quantity": "Sales", "Sales YTD": "Time Intelligence"}
+    row_counts = {"Date": 1461, "Product": 5200, "Customer": 84000, "Sales": 3_200_000}
+    vpa = {
+        "Tables": [
+            {"TableName": t["name"], "RowsCount": row_counts.get(t["name"], 100),
+             "Description": "", "IsReferenced": True}
+            for t in bim["model"]["tables"]
+        ],
+        "Columns": [
+            {
+                "TableName": t["name"], "ColumnName": c["name"], "ColumnType": "Data",
+                "DataType": c["dataType"].capitalize(),
+                "IsHidden": False, "DisplayFolder": "", "Description": "", "FormatString": "",
+                # Key columns left visible on purpose so the taxonomy check has
+                # a real "join key in the field list" finding to report.
+                "IsAvailableInMDX": True, "IsKey": bool(c.get("isKey")),
+                "IsRowNumber": False, "Encoding": "VALUE" if c["dataType"] == "int64" else "HASH",
+            }
+            for t in bim["model"]["tables"] for c in t["columns"]
+        ],
+        "Measures": [
+            {"TableName": t["name"], "MeasureName": m["name"],
+             "MeasureExpression": m["expression"], "FormatString": "",
+             "Description": "", "DisplayFolder": measure_folders.get(m["name"], "")}
+            for t in bim["model"]["tables"] for m in t["measures"]
+        ],
+        "Relationships": [],
+    }
+    dax_model = {"ModelName": "Sample Retail Model.pbix"}
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("Model.bim", json.dumps(bim))
+        z.writestr("DaxVpaView.json", json.dumps(vpa))
+        z.writestr("DaxModel.json", json.dumps(dax_model))
+    return buf.getvalue()
 
 
 # ==========================================================================
@@ -1906,7 +2134,7 @@ def find_unused_columns(model: Dict[str, Any]) -> pd.DataFrame:
     """
     columns_df = _user_facing_columns(model["columns"])
     if columns_df.empty or "TableName" not in columns_df.columns or "ColumnName" not in columns_df.columns:
-        return _ensure_columns(pd.DataFrame(), ["Table", "Column", "Status"])
+        return _ensure_columns(pd.DataFrame(), ["Table", "Column", "Status", "Severity"])
 
     used = referenced_columns(model)
     used_names = {c for _, c in used}
@@ -1923,9 +2151,15 @@ def find_unused_columns(model: Dict[str, Any]) -> pd.DataFrame:
             status = "Referenced somewhere (table ambiguous)"
         else:
             status = "Likely unused"
-        rows.append({"Table": table, "Column": col, "Status": status})
+        # Low, not Medium: this scan can't see report visuals, so a "likely
+        # unused" column is a lead to investigate, never a safe-to-delete
+        # verdict. Ambiguous rows are Info so they don't inflate the score.
+        severity = {"Referenced": "Info",
+                    "Referenced somewhere (table ambiguous)": "Info",
+                    "Likely unused": "Low"}[status]
+        rows.append({"Table": table, "Column": col, "Status": status, "Severity": severity})
 
-    return _ensure_columns(pd.DataFrame(rows), ["Table", "Column", "Status"])
+    return _ensure_columns(pd.DataFrame(rows), ["Table", "Column", "Status", "Severity"])
 
 
 def _column_ref_matcher(table: str, column: str) -> "re.Pattern[str]":
@@ -2281,6 +2515,11 @@ def lint_naming(model: Dict[str, Any]) -> pd.DataFrame:
                     suggestion = f"Most {obj_type.lower()}s on {group} use {dominant} — consider matching it."
                 rows.append({
                     "Object Type": obj_type, "Table": group, "Name": name,
+                    # Naming is presentation, never correctness - a mismatch is
+                    # worth fixing but can't produce a wrong number, so it sits
+                    # at Low in the shared severity vocabulary. Measures are
+                    # nudged to Medium because report authors see those names.
+                    "Severity": "Medium" if obj_type == "Measure" else "Low",
                     "Detected Convention": conv, "Suggestion": suggestion,
                 })
 
@@ -2304,9 +2543,818 @@ def lint_naming(model: Dict[str, Any]) -> pd.DataFrame:
             groups.setdefault(str(r["TableName"]), []).append(str(r["ColumnName"]))
         scan("Column", groups)
 
-    return _ensure_columns(
-        pd.DataFrame(rows), ["Object Type", "Table", "Name", "Detected Convention", "Suggestion"]
+    return sort_by_severity(_ensure_columns(
+        pd.DataFrame(rows),
+        ["Object Type", "Table", "Name", "Severity", "Detected Convention", "Suggestion"],
+    ))
+
+
+# ==========================================================================
+# Severity taxonomy
+# ==========================================================================
+# One vocabulary for every check in the app, so "High" means the same thing
+# in Model Health, Fabric Readiness and the Compression Advisor, and the
+# scorecard can roll them all up without special-casing each module.
+SEVERITY_ORDER: Dict[str, int] = {"High": 0, "Medium": 1, "Low": 2, "Info": 3}
+# Penalty applied to the 100-point model score per finding, per severity.
+SEVERITY_ICON: Dict[str, str] = {"High": "🔴", "Medium": "🟠", "Low": "⚪", "Info": "🔵", "Clean": "🟢"}
+
+
+def sort_by_severity(df: pd.DataFrame, column: str = "Severity") -> pd.DataFrame:
+    """Highest-severity rows first, so the important findings are above the fold."""
+    if df.empty or column not in df.columns:
+        return df
+    out = df.copy()
+    out["_sev"] = out[column].map(lambda s: SEVERITY_ORDER.get(str(s), 9))
+    out = out.sort_values("_sev", kind="stable").drop(columns=["_sev"])
+    return out.reset_index(drop=True)
+
+
+def severity_counts(df: pd.DataFrame, column: str = "Severity") -> Dict[str, int]:
+    if df.empty or column not in df.columns:
+        return {}
+    return {str(k): int(v) for k, v in df[column].value_counts().items()}
+
+
+# ==========================================================================
+# VertiPaq compression & encoding advisor
+# ==========================================================================
+
+def _estimated_distinct(bits: Any) -> Optional[int]:
+    """Rough distinct-value count from a segment's dictionary bit width.
+
+    VertiPaq allocates just enough bits per value to address the column's
+    dictionary, so 2^BitsCount is an upper bound on cardinality. It is an
+    estimate, not a COUNTROWS(DISTINCT()) - a .vpax carries no row data - but
+    it is the only cardinality signal in the export and is accurate enough to
+    separate a 12-value status flag from a 20-million-value transaction ID.
+    """
+    try:
+        b = int(bits)
+    except (TypeError, ValueError):
+        return None
+    if b <= 0 or b > 40:
+        return None
+    return 2 ** b
+
+
+def build_encoding_advice(model: Dict[str, Any]) -> pd.DataFrame:
+    """Per-column storage advice from VertiPaq encoding and segment stats.
+
+    The wins this looks for, in the order they usually pay off:
+      * a big HASH-encoded numeric column - VALUE encoding is cheaper and is
+        chosen automatically once the column is a clean integer type;
+      * a big column whose segments are NOSPLIT (i.e. not run-length encoded)
+        but which has few distinct values - sorting the source by that column
+        during load lets RLE collapse long runs;
+      * a dictionary that dwarfs the data itself, which almost always means a
+        high-cardinality text or decimal column that could be split or rounded;
+      * IsAvailableInMDX left on for hidden columns, which builds an attribute
+        hierarchy nobody queries.
+    """
+    cols = _user_facing_columns(model["columns"])
+    schema = ["Table", "Column", "Encoding", "Compression", "Total Size (MB)",
+              "Dictionary %", "Max Distinct (est.)", "Severity", "Recommendation"]
+    if cols.empty or "TotalSize" not in cols.columns:
+        return _ensure_columns(pd.DataFrame(), schema)
+
+    # Row counts bound the estimate: a column can't have more distinct values
+    # than its table has rows, and 2^BitsCount alone routinely overshoots that
+    # by orders of magnitude.
+    rows_by_table: Dict[str, float] = {}
+    tdf = model["tables"]
+    if not tdf.empty and {"TableName", "RowsCount"}.issubset(tdf.columns):
+        for _, t in tdf.iterrows():
+            n = pd.to_numeric(pd.Series([t.get("RowsCount")]), errors="coerce").iloc[0]
+            if pd.notna(n):
+                rows_by_table[str(t["TableName"])] = float(n)
+
+    # Segment-level compression + bit width, collapsed to one row per column.
+    seg = model.get("segments")
+    comp_by_col: Dict[Tuple[str, str], str] = {}
+    bits_by_col: Dict[Tuple[str, str], Any] = {}
+    if isinstance(seg, pd.DataFrame) and not seg.empty and {"TableName", "ColumnName"}.issubset(seg.columns):
+        for _, s in seg.iterrows():
+            key = (str(s.get("TableName")), str(s.get("ColumnName")))
+            if "CompressionType" in seg.columns and s.get("CompressionType"):
+                comp_by_col.setdefault(key, str(s.get("CompressionType")))
+            if "BitsCount" in seg.columns and pd.notna(s.get("BitsCount")):
+                bits_by_col[key] = max(bits_by_col.get(key, 0) or 0, s.get("BitsCount"))
+
+    total_model_size = pd.to_numeric(cols["TotalSize"], errors="coerce").fillna(0).sum()
+    # Only bother advising on columns big enough to matter: 0.5% of the model
+    # or 1 MB, whichever is smaller. Micro-optimising a 4 KB column is noise.
+    threshold = min(total_model_size * 0.005, 1_000_000) if total_model_size else 0
+
+    rows: List[Dict[str, Any]] = []
+    for _, c in cols.iterrows():
+        table, col = str(c.get("TableName")), str(c.get("ColumnName"))
+        total = pd.to_numeric(pd.Series([c.get("TotalSize")]), errors="coerce").fillna(0).iloc[0]
+        if total < threshold:
+            continue
+        dict_size = pd.to_numeric(pd.Series([c.get("DictionarySize")]), errors="coerce").fillna(0).iloc[0]
+        dict_pct = (dict_size / total * 100) if total else 0.0
+        encoding = str(c.get("Encoding") or "").upper()
+        dtype = str(c.get("DataType") or "")
+        compression = comp_by_col.get((table, col), "")
+        est_distinct = _estimated_distinct(bits_by_col.get((table, col)))
+        row_count = rows_by_table.get(table)
+        if est_distinct and row_count:
+            est_distinct = int(min(est_distinct, row_count))
+        hidden = bool(c.get("IsHidden"))
+        in_mdx = bool(c.get("IsAvailableInMDX"))
+
+        advice: List[str] = []
+        severities: List[str] = []
+
+        def flag(sev: str, text: str) -> None:
+            severities.append(sev)
+            advice.append(text)
+
+        # "Big" here means big relative to this model, so the advisor stays
+        # useful on a 20 MB model and doesn't drown you on a 20 GB one.
+        very_big = total > threshold * 4
+
+        numeric = dtype.lower() in ("int64", "double", "decimal", "currency")
+        if encoding == "HASH" and numeric:
+            flag(
+                "High" if dict_pct > 40 else "Medium",
+                "Numeric column stored with HASH encoding — it carries a dictionary it "
+                "doesn't need. Set `EncodingHint = Value` in Tabular Editor (or clean the "
+                "column to a true integer type) to drop the dictionary entirely.",
+            )
+
+        if compression.upper() == "NOSPLIT" and est_distinct and est_distinct <= 1024:
+            flag(
+                "High" if very_big else "Medium",
+                f"At most ~{est_distinct:,} distinct values but segments are NOSPLIT, so "
+                "run-length encoding isn't kicking in. Sort the source query by this column "
+                "during load — RLE then collapses the long repeated runs.",
+            )
+
+        if dict_pct > 60:
+            flag(
+                "High" if very_big else "Medium",
+                f"The dictionary is {dict_pct:.0f}% of this column's footprint — classic "
+                "high-cardinality text or high-precision decimal. Split it (e.g. date from "
+                "time, prefix from suffix) or round the decimal to the precision you report on.",
+            )
+
+        if hidden and in_mdx:
+            flag(
+                "Medium",
+                "Hidden but still `IsAvailableInMDX = true`, so VertiPaq builds an attribute "
+                "hierarchy no report can use. Setting it to false reclaims that memory.",
+            )
+
+        if not advice:
+            continue
+        severity = min(severities, key=lambda s: SEVERITY_ORDER.get(s, 9))
+        rows.append({
+            "Table": table, "Column": col,
+            "Encoding": encoding or "—",
+            "Compression": compression or "—",
+            "Total Size (MB)": round(_bytes_to_mb(total), 3),
+            "Dictionary %": round(dict_pct, 1),
+            "Max Distinct (est.)": est_distinct if est_distinct else "—",
+            "Severity": severity,
+            "Recommendation": " ".join(advice),
+        })
+
+    df = _ensure_columns(pd.DataFrame(rows), schema)
+    if df.empty:
+        return df
+    return sort_by_severity(df.sort_values("Total Size (MB)", ascending=False))
+
+
+# ==========================================================================
+# Microsoft Fabric / Direct Lake readiness
+# ==========================================================================
+
+def build_fabric_readiness(model: Dict[str, Any]) -> pd.DataFrame:
+    """Check what would block this model from running in Direct Lake mode.
+
+    Direct Lake reads Delta/Parquet straight out of OneLake, which means the
+    features that need an import-engine transform step aren't available. When
+    one of them is present the query falls back to DirectQuery, and the
+    performance advantage disappears silently. These are the blockers that
+    actually appear in .vpax metadata - it can't see everything (e.g. whether
+    the Lakehouse tables are V-Order optimised), so the tab says so explicitly.
+    """
+    schema = ["Check", "Object", "Severity", "Finding", "Fix"]
+    rows: List[Dict[str, Any]] = []
+    bim_tables = model.get("bim_tables") or []
+
+    calc_tables, calc_cols, m_tables = [], [], []
+    for t in bim_tables:
+        name = t.get("name")
+        if not name:
+            continue
+        for p in t.get("partitions") or []:
+            if not isinstance(p, dict):
+                continue
+            src = p.get("source") or {}
+            stype = str((src or {}).get("type") or "").lower()
+            if stype == "calculated":
+                calc_tables.append(name)
+            elif stype == "m":
+                m_tables.append(name)
+        for c in t.get("columns") or []:
+            if isinstance(c, dict) and str(c.get("type") or "").lower() == "calculated":
+                calc_cols.append(f"{name}[{c.get('name')}]")
+
+    if calc_tables:
+        rows.append({
+            "Check": "Calculated tables", "Object": ", ".join(sorted(set(calc_tables))[:12]),
+            "Severity": "High",
+            "Finding": f"{len(set(calc_tables))} calculated table(s). Direct Lake has no DAX "
+                       "engine at load time, so these are not supported.",
+            "Fix": "Materialise them upstream as Lakehouse/Warehouse tables (a notebook, "
+                   "dataflow, or SQL view) and import them as regular Delta tables.",
+        })
+    if calc_cols:
+        rows.append({
+            "Check": "Calculated columns", "Object": ", ".join(sorted(set(calc_cols))[:12]),
+            "Severity": "High",
+            "Finding": f"{len(set(calc_cols))} calculated column(s). Not supported in Direct "
+                       "Lake — the whole table falls back to DirectQuery.",
+            "Fix": "Compute them in the Delta table itself (Spark/SQL) so they arrive as "
+                   "physical columns.",
+        })
+    if m_tables:
+        rows.append({
+            "Check": "Power Query (M) transforms", "Object": f"{len(set(m_tables))} table(s)",
+            "Severity": "Medium",
+            "Finding": "Tables load through M. Direct Lake tables must point at a Delta table "
+                       "with no transform step, so any non-trivial M here has to move upstream.",
+            "Fix": "Push the transform into the Lakehouse (dataflow Gen2 or a notebook) and "
+                   "leave the semantic model as a thin passthrough.",
+        })
+
+    # Auto date/time tables are import-only and quietly bloat the model.
+    auto_date = [t.get("name") for t in bim_tables
+                 if str(t.get("name") or "").startswith(("LocalDateTable_", "DateTableTemplate_"))]
+    if auto_date:
+        rows.append({
+            "Check": "Auto date/time tables", "Object": f"{len(auto_date)} hidden table(s)",
+            "Severity": "High",
+            "Finding": "Power BI's automatic date/time is on. It generates one hidden date "
+                       "table per date column, is unsupported in Direct Lake, and inflates "
+                       "model size in import mode too.",
+            "Fix": "File ➜ Options ➜ Current File ➜ Data Load ➜ untick *Auto date/time*, "
+                   "then use one shared, marked date table.",
+        })
+
+    # Memory guardrails: F-SKUs cap the model, and high-cardinality columns
+    # plus attribute hierarchies are what push a model over the line.
+    cols = _user_facing_columns(model["columns"])
+    if not cols.empty and "TotalSize" in cols.columns:
+        total_bytes = pd.to_numeric(cols["TotalSize"], errors="coerce").fillna(0).sum()
+        total_gb = total_bytes / (1024 ** 3)
+        if total_gb > 0:
+            rows.append({
+                "Check": "F-SKU memory guardrail", "Object": "Whole model",
+                "Severity": "High" if total_gb > 25 else ("Medium" if total_gb > 3 else "Info"),
+                "Finding": f"Column footprint is roughly {total_gb:.2f} GB. Direct Lake keeps "
+                           "the columns it touches resident in memory, and each F-SKU has a "
+                           "hard per-model limit (F64 ≈ 25 GB, F2 ≈ 3 GB).",
+                "Fix": "Drop unused columns, reduce decimal precision, and check the "
+                       "Compression Advisor before sizing the capacity.",
+            })
+
+        if "IsAvailableInMDX" in cols.columns and "IsHidden" in cols.columns:
+            wasted = cols[(cols["IsHidden"] == True) & (cols["IsAvailableInMDX"] == True)]  # noqa: E712
+            if not wasted.empty:
+                rows.append({
+                    "Check": "Unneeded attribute hierarchies",
+                    "Object": f"{len(wasted)} hidden column(s)",
+                    "Severity": "Medium",
+                    "Finding": "Hidden columns still have `IsAvailableInMDX = true`, so an "
+                               "attribute hierarchy is built and kept in memory for columns "
+                               "no report can browse.",
+                    "Fix": "Set IsAvailableInMDX to false on hidden columns — the Fix Script "
+                           "tab generates this for you.",
+                })
+
+    # Direct Lake can't do bi-di relationships against a fallback-free model
+    # reliably, and they're a correctness risk regardless.
+    rels = model["relationships"]
+    if not rels.empty and "Cross Filter Direction" in rels.columns:
+        bidi = rels[rels["Cross Filter Direction"] == "Both"]
+        if not bidi.empty:
+            rows.append({
+                "Check": "Bi-directional relationships",
+                "Object": ", ".join(f"{r['From Table']} ↔ {r['To Table']}" for _, r in bidi.head(8).iterrows()),
+                "Severity": "Medium",
+                "Finding": f"{len(bidi)} bi-directional relationship(s). These are permitted "
+                           "but are a common source of ambiguity and slow DAX in any mode.",
+                "Fix": "Replace with single-direction filtering plus CROSSFILTER() only in "
+                       "the specific measures that need it.",
+            })
+
+    if not rows:
+        rows.append({
+            "Check": "Direct Lake blockers", "Object": "Whole model", "Severity": "Info",
+            "Finding": "No calculated tables/columns, auto date tables, or M-transform "
+                       "blockers found in this export.",
+            "Fix": "Still verify the source Delta tables are V-Order optimised — a .vpax "
+                   "carries no information about the storage layer.",
+        })
+    return sort_by_severity(_ensure_columns(pd.DataFrame(rows), schema))
+
+
+# ==========================================================================
+# Display folder / taxonomy
+# ==========================================================================
+
+def build_taxonomy(model: Dict[str, Any]) -> Tuple[Dict[str, Any], pd.DataFrame]:
+    """Group measures and columns by DisplayFolder, and flag taxonomy gaps.
+
+    Returns (tree, issues). The tree is {table: {folder_path: [items]}} where
+    a folder path of "" means the object sits loose at the root of the table.
+    Issues call out the two things that actually confuse report authors: a
+    measure with no display folder in a table that otherwise uses them, and a
+    foreign-key column left visible in the field list.
+    """
+    tree: Dict[str, Dict[str, List[Dict[str, str]]]] = {}
+    issues: List[Dict[str, Any]] = []
+
+    def add(table: str, folder: str, name: str, kind: str, hidden: bool) -> None:
+        tree.setdefault(table, {}).setdefault(folder or "", []).append(
+            {"name": name, "kind": kind, "hidden": hidden}
+        )
+
+    meas = model["measures"]
+    if {"TableName", "MeasureName"}.issubset(meas.columns):
+        for _, m in meas.dropna(subset=["MeasureName"]).iterrows():
+            add(str(m["TableName"]), str(m.get("DisplayFolder") or ""),
+                str(m["MeasureName"]), "measure", False)
+
+    cols = _user_facing_columns(model["columns"])
+    if {"TableName", "ColumnName"}.issubset(cols.columns):
+        for _, c in cols.dropna(subset=["ColumnName"]).iterrows():
+            add(str(c["TableName"]), str(c.get("DisplayFolder") or ""),
+                str(c["ColumnName"]), "column", bool(c.get("IsHidden")))
+
+    # Orphaned measures: only a problem where the table clearly *has* a
+    # folder taxonomy, otherwise "no folders anywhere" is a valid choice.
+    for table, folders in tree.items():
+        measures_in_folders = sum(
+            1 for f, items in folders.items() if f for i in items if i["kind"] == "measure"
+        )
+        loose = [i["name"] for i in folders.get("", []) if i["kind"] == "measure"]
+        if measures_in_folders and loose:
+            issues.append({
+                "Issue": "Measure outside the folder taxonomy", "Table": table,
+                "Objects": ", ".join(sorted(loose)[:15]),
+                "Severity": "Low",
+                "Why it matters": f"{len(loose)} measure(s) sit at the root while "
+                                  f"{measures_in_folders} are filed in folders — report "
+                                  "authors will scroll past them.",
+            })
+
+    # Visible foreign keys: the single most common cause of a report author
+    # dragging a key column onto a visual and getting a meaningless number.
+    rels = model["relationships"]
+    if not rels.empty and {"TableName", "ColumnName"}.issubset(cols.columns) and "IsHidden" in cols.columns:
+        keys: Set[Tuple[str, str]] = set()
+        for _, r in rels.iterrows():
+            if r.get("From Table") and r.get("From Column"):
+                keys.add((str(r["From Table"]), str(r["From Column"])))
+            if r.get("To Table") and r.get("To Column"):
+                keys.add((str(r["To Table"]), str(r["To Column"])))
+        visible_keys: Dict[str, List[str]] = {}
+        for _, c in cols.iterrows():
+            key = (str(c.get("TableName")), str(c.get("ColumnName")))
+            if key in keys and not bool(c.get("IsHidden")):
+                visible_keys.setdefault(key[0], []).append(key[1])
+        for table, names in visible_keys.items():
+            issues.append({
+                "Issue": "Relationship key visible in the field list", "Table": table,
+                "Objects": ", ".join(sorted(names)),
+                "Severity": "Medium",
+                "Why it matters": "Join keys aren't meaningful to report authors and "
+                                  "summing or grouping by one produces nonsense. Hide them.",
+            })
+
+    issues_df = _ensure_columns(
+        pd.DataFrame(issues), ["Issue", "Table", "Objects", "Severity", "Why it matters"]
     )
+    return tree, sort_by_severity(issues_df)
+
+
+# ==========================================================================
+# RLS filter-propagation simulator
+# ==========================================================================
+
+def simulate_rls(model: Dict[str, Any]) -> pd.DataFrame:
+    """Trace each role's filters through the relationship graph.
+
+    RLS filters propagate exactly the way any other filter does: down the one
+    side to the many side, and back up only where cross-filtering is set to
+    both. So a role that secures a dimension protects every fact hanging off
+    it, but a role that secures a *fact* protects nothing else unless a
+    bi-directional relationship carries the filter back up - and a filter that
+    has to travel up a single-direction relationship is trapped. That is the
+    silent failure this simulates: the role looks configured, the data isn't
+    actually secured.
+    """
+    schema = ["Role", "Secured Table", "Table", "Rows Filtered?", "Severity", "Path / Reason"]
+    roles = model["roles"]
+    if roles.empty or "Role" not in roles.columns:
+        return _ensure_columns(pd.DataFrame(), schema)
+
+    rels = model["relationships"]
+    # Adjacency with the direction filtering actually flows in.
+    # one -> many always; many -> one only when cross-filter is Both.
+    forward: Dict[str, List[Tuple[str, str]]] = {}
+
+    def link(a: str, b: str, why: str) -> None:
+        forward.setdefault(a, []).append((b, why))
+
+    if not rels.empty:
+        for _, r in rels.iterrows():
+            ft, tt = str(r.get("From Table") or ""), str(r.get("To Table") or "")
+            if not ft or not tt or ft == tt:
+                continue
+            if not bool(r.get("Active", True)):
+                continue
+            both = str(r.get("Cross Filter Direction")) == "Both"
+            fcard = str(r.get("From Cardinality") or "Many").lower()
+            # The "one" side filters the "many" side.
+            if fcard.startswith("one"):
+                link(ft, tt, "1→* relationship")
+                if both:
+                    link(tt, ft, "bi-directional relationship")
+            else:
+                link(tt, ft, "1→* relationship")
+                if both:
+                    link(ft, tt, "bi-directional relationship")
+
+    all_tables = set(model["all_table_names"])
+    rows: List[Dict[str, Any]] = []
+
+    for role_name, grp in roles.groupby("Role"):
+        secured = sorted({str(t) for t in grp["Table"].dropna() if str(t)})
+        if not secured:
+            rows.append({
+                "Role": str(role_name), "Secured Table": "—", "Table": "—",
+                "Rows Filtered?": "No", "Severity": "Medium",
+                "Path / Reason": "This role has no table permissions at all — it grants "
+                                 "unrestricted read access to the whole model.",
+            })
+            continue
+
+        for start in secured:
+            reached: Dict[str, str] = {start: "filter defined directly on this table"}
+            queue = deque([start])
+            while queue:
+                cur = queue.popleft()
+                for nxt, why in forward.get(cur, []):
+                    if nxt in reached:
+                        continue
+                    reached[nxt] = f"{reached[cur]} → {cur} → {nxt} ({why})"
+                    queue.append(nxt)
+
+            for table in sorted(all_tables):
+                protected = table in reached
+                if protected:
+                    sev = "Info"
+                    reason = reached[table]
+                else:
+                    # Is it unreachable because of direction, or not connected at all?
+                    connected = any(
+                        table in (str(r.get("From Table")), str(r.get("To Table")))
+                        and start in (str(r.get("From Table")), str(r.get("To Table")))
+                        for _, r in rels.iterrows()
+                    ) if not rels.empty else False
+                    if connected:
+                        sev = "High"
+                        reason = (f"Related to {start}, but the filter can't travel that way — "
+                                  "it would have to go many→one across a single-direction "
+                                  "relationship. Rows here are NOT secured.")
+                    else:
+                        sev = "Low"
+                        reason = f"No filter path from {start}; this table is unaffected by the role."
+                rows.append({
+                    "Role": str(role_name), "Secured Table": start, "Table": table,
+                    "Rows Filtered?": "Yes" if protected else "No",
+                    "Severity": sev, "Path / Reason": reason,
+                })
+
+    return _ensure_columns(pd.DataFrame(rows), schema)
+
+
+def rls_exposure_summary(sim_df: pd.DataFrame, model: Dict[str, Any]) -> pd.DataFrame:
+    """Per-role headline: how many tables each role actually secures.
+
+    Fact tables are what matter — a role that secures every dimension but
+    leaves the fact wide open protects nothing.
+    """
+    schema = ["Role", "Tables Secured", "Tables Exposed", "Trapped Filters", "Severity", "Verdict"]
+    if sim_df.empty:
+        return _ensure_columns(pd.DataFrame(), schema)
+    rows = []
+    for role, grp in sim_df.groupby("Role"):
+        secured = int((grp["Rows Filtered?"] == "Yes").sum())
+        trapped = int((grp["Severity"] == "High").sum())
+        exposed = int((grp["Rows Filtered?"] == "No").sum())
+        if trapped:
+            sev, verdict = "High", (f"{trapped} related table(s) are left unsecured because the "
+                                    "filter can't cross a single-direction relationship.")
+        elif secured <= 1:
+            sev, verdict = "Medium", ("Only the secured table itself is filtered — nothing "
+                                      "propagates. Check this is intentional.")
+        else:
+            sev, verdict = "Info", f"Filters reach {secured} table(s) as expected."
+        rows.append({"Role": role, "Tables Secured": secured, "Tables Exposed": exposed,
+                     "Trapped Filters": trapped, "Severity": sev, "Verdict": verdict})
+    return sort_by_severity(_ensure_columns(pd.DataFrame(rows), schema))
+
+
+# ==========================================================================
+# Model compare / metric drift
+# ==========================================================================
+
+def _normalise_dax(expr: Any) -> str:
+    """Collapse formatting so only real logic changes register as drift.
+
+    Whitespace, line breaks and comments are how one developer's copy of a
+    measure differs from another's without the maths differing at all. Case is
+    preserved deliberately - DAX is case-insensitive, but a renamed reference
+    is worth seeing, and the diff view shows the original text anyway.
+    """
+    s = str(expr or "")
+
+    # String literals are lifted out first: a space inside "North West" is
+    # data, not formatting, and collapsing it would hide a real change.
+    literals: List[str] = []
+
+    def _stash(match: "re.Match[str]") -> str:
+        literals.append(match.group(0))
+        return f"\x00{len(literals) - 1}\x00"
+
+    s = re.sub(r'"(?:[^"]|"")*"', _stash, s)
+    s = re.sub(r"/\*.*?\*/", " ", s, flags=re.S)       # block comments
+    s = re.sub(r"(--|//)[^\n]*", " ", s)                # line comments
+    s = re.sub(r"\s+", " ", s)
+    # Whitespace around operators and punctuation is pure formatting - one
+    # developer's SUMX( Sales, ... ) is another's SUMX(Sales, ...).
+    s = re.sub(r"\s*([(),\[\]{}=<>+\-*/&^:;])\s*", r"\1", s)
+    s = s.strip()
+    for i, lit in enumerate(literals):
+        s = s.replace(f"\x00{i}\x00", lit)
+    return s
+
+
+def compare_models(base: Dict[str, Any], other: Dict[str, Any]) -> Dict[str, Any]:
+    """Diff a working model against a certified baseline.
+
+    The headline case is metric drift: a measure that exists in both models
+    under the same name but whose DAX has been changed locally. That is how a
+    "single source of truth" quietly stops being one — the name still matches
+    the certified metric, so nobody notices the number no longer does.
+    """
+    def measure_map(m: Dict[str, Any]) -> Dict[str, Tuple[str, str]]:
+        df = m["measures"]
+        out: Dict[str, Tuple[str, str]] = {}
+        if {"MeasureName", "MeasureExpression"}.issubset(df.columns):
+            for _, r in df.dropna(subset=["MeasureName"]).iterrows():
+                out[str(r["MeasureName"])] = (str(r.get("TableName") or ""),
+                                              str(r.get("MeasureExpression") or ""))
+        return out
+
+    bm, om = measure_map(base), measure_map(other)
+    drift_rows, added_rows, removed_rows = [], [], []
+
+    for name in sorted(set(bm) & set(om)):
+        b_table, b_expr = bm[name]
+        o_table, o_expr = om[name]
+        moved = b_table != o_table
+        changed = _normalise_dax(b_expr) != _normalise_dax(o_expr)
+        if not changed and not moved:
+            continue
+        if changed:
+            sev, what = "High", "DAX changed"
+        else:
+            sev, what = "Medium", "Moved to a different home table"
+        drift_rows.append({
+            "Measure": name, "Change": what, "Severity": sev,
+            "Baseline Table": b_table, "Compared Table": o_table,
+            "Baseline DAX": b_expr, "Compared DAX": o_expr,
+        })
+    for name in sorted(set(om) - set(bm)):
+        added_rows.append({"Measure": name, "Table": om[name][0], "Severity": "Medium",
+                           "DAX": om[name][1],
+                           "Note": "Exists only in the compared model — a local metric that "
+                                   "isn't part of the certified set."})
+    for name in sorted(set(bm) - set(om)):
+        removed_rows.append({"Measure": name, "Table": bm[name][0], "Severity": "High",
+                             "DAX": bm[name][1],
+                             "Note": "Present in the baseline but missing here — anything "
+                                     "referencing it will break."})
+
+    def name_set(m: Dict[str, Any], kind: str) -> Set[str]:
+        if kind == "tables":
+            return set(m["all_table_names"])
+        cols = _user_facing_columns(m["columns"])
+        if not {"TableName", "ColumnName"}.issubset(cols.columns):
+            return set()
+        return {f"{r['TableName']}[{r['ColumnName']}]" for _, r in cols.dropna(
+            subset=["TableName", "ColumnName"]).iterrows()}
+
+    def rel_set(m: Dict[str, Any]) -> Set[str]:
+        df = m["relationships"]
+        if df.empty:
+            return set()
+        return {
+            f"{r['From Table']}[{r['From Column']}] → {r['To Table']}[{r['To Column']}] "
+            f"({r['Cross Filter Direction']})"
+            for _, r in df.iterrows()
+        }
+
+    struct_rows = []
+    for label, b_set, o_set in (
+        ("Table", name_set(base, "tables"), name_set(other, "tables")),
+        ("Column", name_set(base, "columns"), name_set(other, "columns")),
+        ("Relationship", rel_set(base), rel_set(other)),
+    ):
+        for item in sorted(o_set - b_set):
+            struct_rows.append({"Object Type": label, "Object": item, "Change": "Added",
+                                "Severity": "Low"})
+        for item in sorted(b_set - o_set):
+            struct_rows.append({"Object Type": label, "Object": item, "Change": "Removed",
+                                "Severity": "Medium"})
+
+    return {
+        "drift": _ensure_columns(pd.DataFrame(drift_rows), [
+            "Measure", "Change", "Severity", "Baseline Table", "Compared Table",
+            "Baseline DAX", "Compared DAX"]),
+        "added": _ensure_columns(pd.DataFrame(added_rows), ["Measure", "Table", "Severity", "DAX", "Note"]),
+        "removed": _ensure_columns(pd.DataFrame(removed_rows), ["Measure", "Table", "Severity", "DAX", "Note"]),
+        "structure": _ensure_columns(pd.DataFrame(struct_rows), ["Object Type", "Object", "Change", "Severity"]),
+    }
+
+
+# ==========================================================================
+# Tabular Editor C# fix-script generation
+# ==========================================================================
+
+def _cs_string(value: Any) -> str:
+    """C# verbatim-safe string literal."""
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def build_te_script(
+    model: Dict[str, Any],
+    naming_df: pd.DataFrame,
+    include_renames: bool = True,
+    include_mdx: bool = True,
+    include_hide_keys: bool = True,
+    include_formats: bool = True,
+    include_descriptions: bool = True,
+) -> str:
+    """Emit a C# script for Tabular Editor's Advanced Scripting window.
+
+    Everything the audit tabs flag as a mechanical fix — renames to match the
+    dominant convention, IsAvailableInMdx on hidden columns, hiding join keys,
+    a default format string on unformatted measures — is expressed here as TOM
+    calls. Renames are commented out by default because a rename breaks every
+    report visual that references the old name; the reviewer uncomments the
+    ones they've checked.
+    """
+    lines: List[str] = [
+        "// =====================================================================",
+        "// Generated by VPAX Semantic Model Explorer",
+        f"// Model: {model.get('model_name') or '(unnamed)'}",
+        "//",
+        "// HOW TO RUN",
+        "//   1. Open the model in Tabular Editor (2 or 3).",
+        "//   2. Advanced Scripting tab ➜ paste this script ➜ run (F5).",
+        "//   3. Review the changes, then Save to the model.",
+        "//",
+        "// READ THIS FIRST",
+        "//   Renames are commented out on purpose. Renaming a column or measure",
+        "//   breaks every report visual, bookmark and RLS expression that refers",
+        "//   to the old name. Uncomment only the ones you have checked in the",
+        "//   Impact Analysis tab first.",
+        "// =====================================================================",
+        "",
+    ]
+    emitted = 0
+
+    if include_renames and not naming_df.empty and {"Object Type", "Table", "Name"}.issubset(naming_df.columns):
+        lines += ["// --- 1. Naming convention renames (COMMENTED OUT — review first) ---"]
+        for _, r in naming_df.iterrows():
+            suggestion = str(r.get("Suggestion") or "")
+            m = re.search(r"renaming to `([^`]+)`", suggestion)
+            if not m:
+                continue
+            new_name, obj_type = m.group(1), str(r["Object Type"])
+            table, old = str(r["Table"]), str(r["Name"])
+            if obj_type == "Measure":
+                lines.append(f'// Model.Tables[{_cs_string(table)}].Measures[{_cs_string(old)}]'
+                             f'.Name = {_cs_string(new_name)};')
+            elif obj_type == "Column":
+                lines.append(f'// Model.Tables[{_cs_string(table)}].Columns[{_cs_string(old)}]'
+                             f'.Name = {_cs_string(new_name)};')
+            elif obj_type == "Table":
+                lines.append(f'// Model.Tables[{_cs_string(old)}].Name = {_cs_string(new_name)};')
+            else:
+                continue
+            emitted += 1
+        lines.append("")
+
+    cols = _user_facing_columns(model["columns"])
+
+    if include_mdx and not cols.empty and {"IsHidden", "IsAvailableInMDX"}.issubset(cols.columns):
+        targets = cols[(cols["IsHidden"] == True) & (cols["IsAvailableInMDX"] == True)]  # noqa: E712
+        if not targets.empty:
+            lines += [
+                "// --- 2. Drop attribute hierarchies on hidden columns ---",
+                "// Hidden columns can't be browsed, so the attribute hierarchy VertiPaq",
+                "// builds for them is pure memory overhead. Safe and reversible.",
+            ]
+            for _, c in targets.iterrows():
+                lines.append(
+                    f'Model.Tables[{_cs_string(c["TableName"])}]'
+                    f'.Columns[{_cs_string(c["ColumnName"])}].IsAvailableInMdx = false;'
+                )
+                emitted += 1
+            lines.append("")
+
+    if include_hide_keys:
+        rels = model["relationships"]
+        key_targets: List[Tuple[str, str]] = []
+        if not rels.empty and not cols.empty and "IsHidden" in cols.columns:
+            keys: Set[Tuple[str, str]] = set()
+            for _, r in rels.iterrows():
+                if r.get("From Table") and r.get("From Column"):
+                    keys.add((str(r["From Table"]), str(r["From Column"])))
+                if r.get("To Table") and r.get("To Column"):
+                    keys.add((str(r["To Table"]), str(r["To Column"])))
+            for _, c in cols.iterrows():
+                pair = (str(c.get("TableName")), str(c.get("ColumnName")))
+                if pair in keys and not bool(c.get("IsHidden")):
+                    key_targets.append(pair)
+        if key_targets:
+            lines += [
+                "// --- 3. Hide relationship key columns ---",
+                "// Join keys aren't meaningful to report authors; grouping by one",
+                "// produces a misleading number. Hiding is non-breaking.",
+            ]
+            for table, col in key_targets:
+                lines.append(
+                    f'Model.Tables[{_cs_string(table)}].Columns[{_cs_string(col)}].IsHidden = true;'
+                )
+                emitted += 1
+            lines.append("")
+
+    if include_formats:
+        meas = model["measures"]
+        if not meas.empty and "MeasureName" in meas.columns:
+            unformatted = meas[
+                meas.get("FormatString", pd.Series([""] * len(meas), index=meas.index))
+                .fillna("").astype(str).str.strip() == ""
+            ] if "FormatString" in meas.columns else meas.iloc[0:0]
+            if not unformatted.empty:
+                lines += [
+                    "// --- 4. Default format string on unformatted measures ---",
+                    '// Adjust "#,0.00" to your standard before running.',
+                ]
+                for _, m in unformatted.iterrows():
+                    lines.append(
+                        f'Model.Tables[{_cs_string(m["TableName"])}]'
+                        f'.Measures[{_cs_string(m["MeasureName"])}].FormatString = "#,0.00";'
+                    )
+                    emitted += 1
+                lines.append("")
+
+    if include_descriptions:
+        meas = model["measures"]
+        if not meas.empty and "MeasureName" in meas.columns and "Description" in meas.columns:
+            undocumented = meas[meas["Description"].fillna("").astype(str).str.strip() == ""]
+            if not undocumented.empty:
+                lines += [
+                    "// --- 5. Description placeholders ---",
+                    "// Stubs only — replace the text with the real business definition.",
+                ]
+                for _, m in undocumented.head(200).iterrows():
+                    lines.append(
+                        f'// Model.Tables[{_cs_string(m["TableName"])}]'
+                        f'.Measures[{_cs_string(m["MeasureName"])}].Description = '
+                        f'"TODO: business definition";'
+                    )
+                    emitted += 1
+                lines.append("")
+
+    if not emitted:
+        lines.append("// Nothing to fix — none of the selected checks found actionable items.")
+    else:
+        lines += [
+            'Info("VPAX Explorer fix script finished. Review the changes, then Save.");',
+        ]
+    return "\n".join(lines)
 
 
 # ==========================================================================
@@ -2399,6 +3447,7 @@ def build_data_dictionary_excel(
     health_df: pd.DataFrame,
     naming_df: pd.DataFrame,
     unused_df: pd.DataFrame,
+    extra_sheets: Optional[List[Tuple[str, pd.DataFrame]]] = None,
 ) -> bytes:
     """One workbook, one sheet per topic - the whole model plus this app's
     health/naming/unused-object findings, in the format people actually want
@@ -2424,6 +3473,7 @@ def build_data_dictionary_excel(
         ("Naming Conventions", naming_df),
         ("Unused Columns", unused_df),
     ]
+    sheets.extend(extra_sheets or [])
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine=EXCEL_ENGINE) as writer:
@@ -2492,8 +3542,9 @@ st.markdown(
     """
     <div class="app-hero">
       <h1>🧩 VPAX Semantic Model Explorer</h1>
-      <p>Explore the semantic model behind a Power BI report — screens, ER diagrams,
-         measures, lineage and source SQL — straight from a .vpax export.</p>
+      <p>Explore, audit and govern the semantic model behind a Power BI report — ER
+         diagrams, lineage, DAX quality, VertiPaq compression, RLS propagation, metric
+         drift and Fabric readiness — straight from a .vpax export.</p>
       <span class="badge">Made by Sourin</span>
     </div>
     """,
@@ -2508,24 +3559,68 @@ with st.sidebar:
             "Export from **DAX Studio** (Advanced ➜ Export Metadata) or "
             "**Tabular Editor** (File ➜ Export ➜ Metadata)."
         )
+        if st.button(
+            "🧪 Try a sample model", width="stretch", key="btn_sample",
+            help="Loads a small built-in star schema so you can see every section "
+                 "without exporting anything first.",
+        ):
+            st.session_state["use_sample"] = True
     with st.expander("🖥️ Add report pages (.pbix) — optional"):
         pbix_file = st.file_uploader("Choose a .pbix file", type=["pbix"], label_visibility="collapsed")
         st.caption(
             "A .vpax holds the **semantic model only** and carries no report pages. "
             "Add the .pbix to list the real pages and see the model per page."
         )
+    with st.expander("🆚 Compare against a baseline (.vpax) — optional"):
+        baseline_file = st.file_uploader(
+            "Choose the certified/baseline .vpax", type=["vpax"],
+            label_visibility="collapsed", key="baseline_upload",
+        )
+        st.caption(
+            "Upload the **certified** model here and your working model above. "
+            "The *Model Compare* section then shows which measures have drifted."
+        )
 
-if not uploaded:
-    st.info("👈 Upload a **.vpax** file from the sidebar to get started.")
+# A real upload always wins over the sample, so the sample never sticks
+# around confusingly once the user brings their own file.
+if uploaded is not None:
+    st.session_state["use_sample"] = False
+    source_bytes: Optional[bytes] = uploaded.getvalue()
+    is_sample = False
+elif st.session_state.get("use_sample"):
+    source_bytes, is_sample = build_sample_vpax_bytes(), True
+else:
+    source_bytes, is_sample = None, False
+
+if source_bytes is None:
+    st.info(
+        "👈 Upload a **.vpax** file from the sidebar to get started — or hit "
+        "**🧪 Try a sample model** to explore with a built-in one."
+    )
     st.markdown(f'<div class="app-footer">{AUTHOR}</div>', unsafe_allow_html=True)
     st.stop()
 
 try:
     with st.spinner("Parsing model metadata…"):
-        model = load_model(uploaded.getvalue())
+        model = load_model(source_bytes)
 except Exception as exc:  # noqa: BLE001
     st.error(f"Could not parse this file as a vpax model: {exc}")
     st.stop()
+
+if is_sample:
+    st.info(
+        "Showing the **built-in sample model** — a four-table star schema with a few "
+        "deliberate flaws so the audit sections have something real to report. "
+        "Upload your own .vpax in the sidebar to replace it.",
+        icon="🧪",
+    )
+
+baseline_model: Optional[Dict[str, Any]] = None
+if baseline_file is not None:
+    try:
+        baseline_model = load_model(baseline_file.getvalue())
+    except Exception as exc:  # noqa: BLE001
+        st.warning(f"Could not read the baseline .vpax: {exc}", icon="⚠️")
 
 report: Optional[Dict[str, Any]] = None
 if pbix_file is not None:
@@ -2587,18 +3682,310 @@ def tab_guard(tab_name: str):
         )
 
 
-tabs = st.tabs([
-    "🖥️ Dashboard Screens", "🌐 Semantic Model by Screen", "🗂️ Tables",
-    "🧱 Columns / Schema", "📐 Measures", "🧮 Calculated Columns",
-    "🔗 Relationships", "🛢️ Power Query (SQL)",
-    "📦 Model Size", "🧹 Unused Objects", "🔎 Impact Analysis",
-    "📊 Measure Dependencies", "✅ Model Health", "🔤 Naming Conventions",
-    "📅 Date Table Check", "🔐 Security & Perspectives", "📄 Data Dictionary Export",
-    "🎨 Theme",
-])
+# ==========================================================================
+# One scan, reused everywhere
+# ==========================================================================
+# Every audit section, the scorecard, the sidebar badges and the Excel export
+# read the same finding sets. Computing them once - cached on the uploaded
+# bytes, so a rerun costs nothing - keeps a big model responsive and
+# guarantees the scorecard can never disagree with the tab it links to.
+
+@st.cache_data(show_spinner=False)
+def compute_all_findings(file_bytes: bytes) -> Dict[str, Any]:
+    m = load_model(file_bytes)
+    graph = build_measure_graph(m)
+    taxonomy_tree, taxonomy_issues = build_taxonomy(m)
+    rls_sim = simulate_rls(m)
+    return {
+        "health": run_health_checks(m),
+        "naming": lint_naming(m),
+        "unused": find_unused_columns(m),
+        "encoding": build_encoding_advice(m),
+        "fabric": build_fabric_readiness(m),
+        "taxonomy_tree": taxonomy_tree,
+        "taxonomy_issues": taxonomy_issues,
+        "rls_sim": rls_sim,
+        "rls_summary": rls_exposure_summary(rls_sim, m),
+        "measure_graph": graph,
+        "cycles": find_cycles(graph),
+        "size": build_model_size_summary(m),
+    }
+
+
+with st.status("Scanning the model…", expanded=False) as _scan_status:
+    findings = compute_all_findings(source_bytes)
+    _scan_status.update(
+        label=f"Scanned {len(model['all_table_names'])} tables, "
+              f"{len(model['measures'])} measures",
+        state="complete",
+    )
+
+health_df = findings["health"]
+naming_df = findings["naming"]
+unused_df = findings["unused"]
+encoding_df = findings["encoding"]
+fabric_df = findings["fabric"]
+taxonomy_tree = findings["taxonomy_tree"]
+taxonomy_issues = findings["taxonomy_issues"]
+rls_sim_df = findings["rls_sim"]
+rls_summary_df = findings["rls_summary"]
+
+
+# ==========================================================================
+# Navigation
+# ==========================================================================
+# Grouped by *what you came here to do*, not by object type. Eighteen flat
+# tabs meant a junior developer had to already know which tab answered their
+# question; four verbs plus a scorecard means they don't.
+NAV_GROUPS: Dict[str, List[str]] = {
+    "🧭 Overview": ["Model Scorecard"],
+    "🔍 Explore": [
+        "Dashboard Screens", "Semantic Model by Screen", "Tables", "Columns / Schema",
+        "Measures", "Calculated Columns", "Relationships", "Power Query (SQL)",
+        "Display Folders",
+    ],
+    "🩺 Audit": [
+        "Model Health", "Naming Conventions", "Unused Objects", "Date Table Check",
+        "Model Size", "Compression Advisor", "Fabric Readiness",
+    ],
+    "🔬 Investigate": ["Impact Analysis", "Measure Dependencies", "Model Compare"],
+    "🛡️ Govern": [
+        "Security & Perspectives", "RLS Simulator", "Fix Script (C#)",
+        "Data Dictionary Export", "Theme",
+    ],
+}
+
+# Which finding set backs each page, so the scorecard and the sidebar badges
+# both derive from one declaration instead of two hand-maintained lists.
+PAGE_FINDINGS: Dict[str, Tuple[str, pd.DataFrame, str]] = {
+    "Model Health": ("Best-practice violations", health_df, "Severity"),
+    "Naming Conventions": ("Objects off the dominant convention", naming_df, "Severity"),
+    "Unused Objects": ("Columns nothing references", unused_df, "Severity"),
+    "Compression Advisor": ("Columns wasting memory", encoding_df, "Severity"),
+    "Fabric Readiness": ("Direct Lake blockers", fabric_df, "Severity"),
+    "Display Folders": ("Taxonomy gaps", taxonomy_issues, "Severity"),
+    "RLS Simulator": ("Roles with unsecured tables", rls_summary_df, "Severity"),
+}
+
+
+def _page_severity_counts(page: str) -> Dict[str, int]:
+    entry = PAGE_FINDINGS.get(page)
+    if not entry:
+        return {}
+    _, df, col = entry
+    counts = severity_counts(df, col)
+    counts.pop("Info", None)  # Info is context, not a finding
+    return counts
+
+
+def _group_severity_counts(group: str) -> Dict[str, int]:
+    total: Dict[str, int] = {}
+    for page in NAV_GROUPS[group]:
+        for sev, n in _page_severity_counts(page).items():
+            total[sev] = total.get(sev, 0) + n
+    return total
+
+
+def _goto(group: str, page: str) -> None:
+    """Jump the nav somewhere else — used by the scorecard's issue cards."""
+    st.session_state["nav_group"] = group
+    st.session_state["nav_page"] = page
+
+
+def _page_group(page: str) -> str:
+    for g, pages in NAV_GROUPS.items():
+        if page in pages:
+            return g
+    return "🧭 Overview"
+
+
+def _badge(counts: Dict[str, int]) -> str:
+    if counts.get("High"):
+        return f" 🔴 {counts['High']}"
+    if counts.get("Medium"):
+        return f" 🟠 {counts['Medium']}"
+    if counts.get("Low"):
+        return f" ⚪ {counts['Low']}"
+    return " 🟢"
+
+
+with st.sidebar:
+    st.markdown('<div class="sb-title">🧭 Sections</div>', unsafe_allow_html=True)
+    nav_group = st.radio(
+        "nav_group", list(NAV_GROUPS),
+        format_func=lambda g: g + ("" if g == "🧭 Overview" else _badge(_group_severity_counts(g))),
+        key="nav_group", label_visibility="collapsed",
+    )
+    st.caption("🔴 high · 🟠 medium · ⚪ low · 🟢 clear")
+
+    st.markdown('<div class="sb-title" style="margin-top:1rem">🔎 Find anything</div>',
+                unsafe_allow_html=True)
+    search_term = st.text_input(
+        "search", placeholder="table, column or measure…",
+        label_visibility="collapsed", key="global_search",
+    )
+
+_pages = NAV_GROUPS[nav_group]
+# Keep the page selection valid when the group changes. Setting the key
+# before the widget is created is the supported way to steer a Streamlit
+# radio programmatically, and is what makes the scorecard cards clickable.
+if st.session_state.get("nav_page") not in _pages:
+    st.session_state["nav_page"] = _pages[0]
+
+if len(_pages) > 1:
+    nav_page = st.radio(
+        "nav_page", _pages, horizontal=True, key="nav_page", label_visibility="collapsed",
+        format_func=lambda p: p + (_badge(_page_severity_counts(p)) if p in PAGE_FINDINGS else ""),
+    )
+else:
+    nav_page = _pages[0]
+
+# --- Global search ------------------------------------------------------------
+if search_term and search_term.strip():
+    with tab_guard("Search"):
+        term = search_term.strip().lower()
+        hits: List[Dict[str, str]] = []
+        for t in model["all_table_names"]:
+            if term in t.lower():
+                hits.append({"Type": "Table", "Table": t, "Name": t, "Detail": ""})
+        _cols = _user_facing_columns(model["columns"])
+        if {"TableName", "ColumnName"}.issubset(_cols.columns):
+            for _, c in _cols.dropna(subset=["ColumnName"]).iterrows():
+                if term in str(c["ColumnName"]).lower():
+                    hits.append({"Type": "Column", "Table": str(c["TableName"]),
+                                 "Name": str(c["ColumnName"]),
+                                 "Detail": str(c.get("DataType") or "")})
+        _meas = model["measures"]
+        if {"TableName", "MeasureName"}.issubset(_meas.columns):
+            for _, m in _meas.dropna(subset=["MeasureName"]).iterrows():
+                name, expr = str(m["MeasureName"]), str(m.get("MeasureExpression") or "")
+                if term in name.lower() or term in expr.lower():
+                    where = "name" if term in name.lower() else "DAX"
+                    hits.append({"Type": "Measure", "Table": str(m["TableName"]),
+                                 "Name": name, "Detail": f"matched in {where}"})
+        st.markdown(f"### 🔎 {len(hits)} match(es) for “{html.escape(search_term.strip())}”")
+        if not hits:
+            st.info("Nothing in this model matches that. Search covers table, column and "
+                    "measure names, plus the text of every measure's DAX.")
+        else:
+            show_table(pd.DataFrame(hits), f"search_{_slug(search_term)}", height=320, key="search_hits")
+            st.caption("Use **Investigate ➜ Impact Analysis** to see what references any of these "
+                       "before you rename or delete it.")
+        st.divider()
+
+
+# --- Model Scorecard ----------------------------------------------------------
+if nav_page == "Model Scorecard":
+    with tab_guard("Model Scorecard"):
+        st.subheader("Model scorecard")
+        st.caption(
+            "Every check in this app, rolled into one view. The score starts at 100 and "
+            "loses points per finding weighted by severity — it's a relative health "
+            "signal for triage, not an official Microsoft metric."
+        )
+
+        # Each section can lose at most an equal share of the 100 points, and
+        # within a section it's the *worst* severity that dominates, not the
+        # raw count. Straight count-weighting doesn't work here: nearly every
+        # real model has hundreds of missing descriptions, which would peg
+        # every model at the same rock-bottom score and hide the one genuine
+        # high-severity problem that actually needs attention.
+        SECTION_CAP = 100.0 / max(len(PAGE_FINDINGS), 1)
+        BASE_BY_WORST = {"High": 0.60, "Medium": 0.35, "Low": 0.12, "Clean": 0.0}
+
+        penalty = 0.0
+        cards: List[Dict[str, Any]] = []
+        for page, (title, df, col) in PAGE_FINDINGS.items():
+            counts = _page_severity_counts(page)
+            worst = "Clean"
+            for s in ("High", "Medium", "Low"):
+                if counts.get(s):
+                    worst = s
+                    break
+            share = BASE_BY_WORST[worst]
+            if worst != "Clean":
+                # How widespread the worst class is scales the remaining
+                # headroom, so 1 high-severity finding and 40 don't score alike.
+                spread = min(1.0, counts.get(worst, 0) / 10.0)
+                share += (1.0 - share) * spread * 0.7
+            penalty += SECTION_CAP * share
+            cards.append({"page": page, "title": title, "counts": counts, "worst": worst})
+
+        score = max(0, min(100, round(100 - penalty)))
+        grade, colour = (
+            ("Healthy", "#16a34a") if score >= 85 else
+            ("Needs attention", "#d97706") if score >= 60 else
+            ("At risk", "#dc2626")
+        )
+        total_high = sum(c["counts"].get("High", 0) for c in cards)
+        total_med = sum(c["counts"].get("Medium", 0) for c in cards)
+        total_low = sum(c["counts"].get("Low", 0) for c in cards)
+
+        head = st.columns([1, 3])
+        with head[0]:
+            st.markdown(
+                f'<div class="score-ring" style="background:{colour}">'
+                f'<span class="num">{score}</span><span class="lbl">score</span></div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<div style='text-align:center;font-weight:600;color:{colour};margin-top:.4rem'>"
+                f"{grade}</div>", unsafe_allow_html=True,
+            )
+        with head[1]:
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("🔴 High", total_high, help="Likely wrong, insecure, or a real performance risk.")
+            k2.metric("🟠 Medium", total_med, help="A design choice worth double-checking.")
+            k3.metric("⚪ Low", total_low, help="Hygiene and documentation gaps.")
+            k4.metric("Tables", len(model["all_table_names"]))
+            if total_high:
+                st.error(f"**{total_high} high-severity finding(s)** — start there.", icon="🔴")
+            elif total_med:
+                st.warning(f"No high-severity findings. {total_med} medium item(s) to review.", icon="🟠")
+            else:
+                st.success("No high or medium findings. This model is in good shape.", icon="✅")
+
+        st.markdown("#### Where the findings are")
+        cards.sort(key=lambda c: (SEVERITY_ORDER.get(c["worst"], 9),
+                                  -sum(c["counts"].values())))
+        for i, c in enumerate(cards):
+            row = st.columns([6, 1])
+            bits = " · ".join(f"{SEVERITY_ICON[s]} {c['counts'][s]} {s.lower()}"
+                              for s in ("High", "Medium", "Low") if c["counts"].get(s))
+            desc = bits or "Nothing flagged."
+            row[0].markdown(
+                f'<div class="issue-card sev-{c["worst"]}">'
+                f'<div class="title">{html.escape(c["page"])}'
+                f'<span class="badge-pill {c["worst"]}">{c["worst"]}</span></div>'
+                f'<div class="desc">{html.escape(c["title"])} — {desc}</div></div>',
+                unsafe_allow_html=True,
+            )
+            row[1].button(
+                "Open →", key=f"goto_{i}", width="stretch",
+                on_click=_goto, args=(_page_group(c["page"]), c["page"]),
+            )
+
+        with st.expander("📋 Guided review checklist — first pass on an unfamiliar model"):
+            st.markdown(
+                "Work top to bottom. Each step names the section that answers it.\n\n"
+                "1. **Does it load and what's in it?** — *Explore ➜ Tables* and *Measures*.\n"
+                "2. **Is the shape a star schema?** — *Explore ➜ Relationships*; facts should "
+                "sit in the middle with dimensions on the one side.\n"
+                "3. **Is there one marked date table?** — *Audit ➜ Date Table Check*. Time "
+                "intelligence silently misbehaves without it.\n"
+                "4. **Anything obviously wrong?** — *Audit ➜ Model Health*, high severity first.\n"
+                "5. **Where is the memory going?** — *Audit ➜ Model Size*, then "
+                "*Compression Advisor* for the specific fix.\n"
+                "6. **Is security real?** — *Govern ➜ RLS Simulator*, not just the role list.\n"
+                "7. **Can it move to Fabric?** — *Audit ➜ Fabric Readiness*.\n"
+                "8. **Before you change anything** — *Investigate ➜ Impact Analysis* on the "
+                "object you're about to touch.\n"
+                "9. **Hand it over** — *Govern ➜ Data Dictionary Export*, and "
+                "*Fix Script (C#)* for the mechanical cleanups."
+            )
 
 # --- Dashboard Screens ----------------------------------------------------
-with tabs[0]:
+if nav_page == "Dashboard Screens":
     with tab_guard('Dashboard Screens'):
         st.subheader("Dashboard screens / pages")
         screens_df = model["screens"]
@@ -2690,7 +4077,7 @@ with tabs[0]:
             )
 
 # --- Semantic Model by Screen ---------------------------------------------
-with tabs[1]:
+if nav_page == "Semantic Model by Screen":
     with tab_guard('Semantic Model by Screen'):
         st.subheader("Semantic model per screen")
         screens_df = model["screens"]
@@ -2933,13 +4320,13 @@ with tabs[1]:
                                    f"{screen_table} measures", height=330, key=f"meas_{idx}")
 
 # --- Tables ---------------------------------------------------------------
-with tabs[2]:
+if nav_page == "Tables":
     with tab_guard('Tables'):
         st.subheader("Tables in the model")
         show_table(model["tables"], "Tables", height=420, key="tables")
 
 # --- Columns / Schema -----------------------------------------------------
-with tabs[3]:
+if nav_page == "Columns / Schema":
     with tab_guard('Columns / Schema'):
         st.subheader("Columns per table")
         schema_df = model["columns"]
@@ -2957,7 +4344,7 @@ with tabs[3]:
             show_table(view.reset_index(drop=True), "Columns", height=460, key="columns")
 
 # --- Measures -------------------------------------------------------------
-with tabs[4]:
+if nav_page == "Measures":
     with tab_guard('Measures'):
         st.subheader("DAX measures")
         meas_df = model["measures"]
@@ -2982,7 +4369,7 @@ with tabs[4]:
             show_table(view.reset_index(drop=True), "Measures", height=460, key="measures")
 
 # --- Calculated Columns ---------------------------------------------------
-with tabs[5]:
+if nav_page == "Calculated Columns":
     with tab_guard('Calculated Columns'):
         st.subheader("Calculated columns")
         cols_df = model["calc_columns"]
@@ -2993,7 +4380,7 @@ with tabs[5]:
             show_table(enriched.reset_index(drop=True), "Calculated Columns", height=460, key="calccols")
 
 # --- Relationships --------------------------------------------------------
-with tabs[6]:
+if nav_page == "Relationships":
     with tab_guard('Relationships'):
         st.subheader("Relationships")
         rel_df = model["relationships"]
@@ -3008,7 +4395,7 @@ with tabs[6]:
             show_table(rel_df, "Relationships", height=460, key="rels")
 
 # --- Power Query ----------------------------------------------------------
-with tabs[7]:
+if nav_page == "Power Query (SQL)":
     with tab_guard('Power Query (SQL)'):
         st.subheader("Source SQL behind each table")
         pq_df = model["power_query"]
@@ -3036,7 +4423,7 @@ with tabs[7]:
                 )
 
 # --- Model Size (VertiPaq) -------------------------------------------------
-with tabs[8]:
+if nav_page == "Model Size":
     with tab_guard('Model Size'):
         st.subheader("Model size & VertiPaq statistics")
         st.caption(
@@ -3049,7 +4436,7 @@ with tabs[8]:
             "columns entirely in favour of a measure. All sizes are shown in MB (compressed "
             "in-memory size, not file size)."
         )
-        size_summary = build_model_size_summary(model)
+        size_summary = findings["size"]
         if not size_summary.get("available"):
             st.info(
                 "This .vpax export doesn't include VertiPaq size/cardinality statistics. "
@@ -3081,7 +4468,7 @@ with tabs[8]:
                 show_table(size_summary["encoding_breakdown"], "Encoding Breakdown", height=220, key="vpa_encoding")
 
 # --- Unused Objects ---------------------------------------------------------
-with tabs[9]:
+if nav_page == "Unused Objects":
     with tab_guard('Unused Objects'):
         st.subheader("Columns not referenced by any measure, calculated column, or relationship")
         st.caption(
@@ -3089,18 +4476,27 @@ with tabs[9]:
             "none) or RLS filter expressions. Treat 'Likely unused' as a starting point for "
             "review, not a guarantee it's safe to delete."
         )
-        unused_df = find_unused_columns(model)
         if unused_df.empty:
             st.info("No column metadata available to check.")
         else:
             likely_unused = int((unused_df["Status"] == "Likely unused").sum())
             c1, c2 = st.columns(2)
-            c1.metric("Likely unused columns", likely_unused)
+            c1.metric("⚪ Likely unused columns", likely_unused)
             c2.metric("Total columns", len(unused_df))
-            show_table(unused_df, "Unused Columns", height=460, key="unused")
+            only_unused = st.checkbox("Hide referenced columns", value=True, key="unused_only")
+            view = unused_df[unused_df["Status"] == "Likely unused"] if only_unused else unused_df
+            if view.empty:
+                st.success("Every column is referenced somewhere in the model.", icon="✅")
+            else:
+                show_table(view, "Unused Columns", height=460, key="unused")
+                st.caption(
+                    "Before removing any of these, confirm in **Investigate ➜ Impact Analysis** "
+                    "and check the live report — a column used only on a visual axis looks "
+                    "unused to a metadata-only scan."
+                )
 
 # --- Impact Analysis ---------------------------------------------------------
-with tabs[10]:
+if nav_page == "Impact Analysis":
     with tab_guard('Impact Analysis'):
         st.subheader("What references this table or column?")
         st.caption(
@@ -3154,7 +4550,7 @@ with tabs[10]:
                 show_table(result["related_tables"], f"{label} related tables", height=180, key="impact_related")
 
 # --- Measure Dependencies ----------------------------------------------------
-with tabs[11]:
+if nav_page == "Measure Dependencies":
     with tab_guard('Measure Dependencies'):
         st.subheader("Which measures call other measures")
         st.caption(
@@ -3163,11 +4559,11 @@ with tabs[11]:
             "involved. Blank cells just mean that measure neither calls nor is called by another "
             "measure in this model."
         )
-        graph = build_measure_graph(model)
+        graph = findings["measure_graph"]
         if not graph:
             st.info("No measures found in this model.")
         else:
-            cycles = find_cycles(graph)
+            cycles = findings["cycles"]
             if cycles:
                 st.warning(
                     f"⚠️ {len(cycles)} circular measure reference(s) found — these can never "
@@ -3188,7 +4584,7 @@ with tabs[11]:
                     static_diagram_panel(dot, engine="dot", filename="measure_dependencies")
 
 # --- Model Health -------------------------------------------------------------
-with tabs[12]:
+if nav_page == "Model Health":
     with tab_guard('Model Health'):
         st.subheader("Model health & best-practice checks")
         st.caption(
@@ -3202,30 +4598,50 @@ with tabs[12]:
             "descriptions, inconsistent format strings, or a calculated column that might be "
             "cheaper to compute upstream in Power Query."
         )
-        health_df = run_health_checks(model)
         if health_df.empty:
-            st.info("No health-check findings for this model.")
+            st.success("No health-check findings for this model.", icon="✅")
         else:
             counts = health_df["Severity"].value_counts()
             c1, c2, c3 = st.columns(3)
-            c1.metric("High", int(counts.get("High", 0)), help="Likely wrong or a real performance risk — worth fixing.")
-            c2.metric("Medium", int(counts.get("Medium", 0)), help="A design choice worth double-checking.")
-            c3.metric("Low", int(counts.get("Low", 0)), help="Hygiene/documentation gaps — doesn't affect correctness.")
-            show_table(health_df, "Model Health", height=460, key="health")
+            c1.metric("🔴 High", int(counts.get("High", 0)), help="Likely wrong or a real performance risk — worth fixing.")
+            c2.metric("🟠 Medium", int(counts.get("Medium", 0)), help="A design choice worth double-checking.")
+            c3.metric("⚪ Low", int(counts.get("Low", 0)), help="Hygiene/documentation gaps — doesn't affect correctness.")
+            only_high = st.checkbox(
+                "Show high severity only", value=bool(counts.get("High", 0) > 12),
+                key="health_only_high",
+            )
+            view = health_df[health_df["Severity"] == "High"] if only_high else health_df
+            show_table(sort_by_severity(view), "Model Health", height=460, key="health")
+            st.caption(
+                "Mechanical fixes for several of these — hiding join keys, dropping unused "
+                "attribute hierarchies, adding format strings — are generated as a runnable "
+                "script under **Govern ➜ Fix Script (C#)**."
+            )
 
 # --- Naming Conventions -------------------------------------------------------
-with tabs[13]:
+if nav_page == "Naming Conventions":
     with tab_guard('Naming Conventions'):
         st.subheader("Naming convention consistency")
-        naming_df = lint_naming(model)
         if naming_df.empty:
-            st.info("No inconsistent naming detected.")
+            st.success("Every object matches the dominant convention in its group.", icon="✅")
         else:
-            st.caption(f"{len(naming_df)} object(s) don't match the dominant naming convention in their group.")
-            show_table(naming_df, "Naming Conventions", height=460, key="naming")
+            st.caption(
+                f"{len(naming_df)} object(s) don't match the dominant naming convention in "
+                "their group. Measure names are rated Medium because report authors see them; "
+                "column and table names Low."
+            )
+            kinds = ["(all)"] + sorted(naming_df["Object Type"].dropna().unique().tolist())
+            pick_kind = st.selectbox("Object type", kinds, key="naming_kind")
+            view = naming_df if pick_kind == "(all)" else naming_df[naming_df["Object Type"] == pick_kind]
+            show_table(sort_by_severity(view), "Naming Conventions", height=460, key="naming")
+            st.caption(
+                "**Govern ➜ Fix Script (C#)** emits these as ready-to-run renames — commented "
+                "out, because a rename breaks every visual that referenced the old name. "
+                "Check **Investigate ➜ Impact Analysis** first."
+            )
 
 # --- Date Table Check ---------------------------------------------------------
-with tabs[14]:
+if nav_page == "Date Table Check":
     with tab_guard('Date Table Check'):
         st.subheader("Date table / time-intelligence check")
         st.info(
@@ -3240,7 +4656,7 @@ with tabs[14]:
             show_table(date_df, "Date Tables", height=320, key="date_tables")
 
 # --- Security & Perspectives ---------------------------------------------------
-with tabs[15]:
+if nav_page == "Security & Perspectives":
     with tab_guard('Security & Perspectives'):
         st.subheader("Row-level security roles & perspectives")
         sub = st.tabs(["Roles (RLS)", "Perspectives"])
@@ -3258,7 +4674,7 @@ with tabs[15]:
                 show_table(persp_df, "Perspectives", height=380, key="perspectives")
 
 # --- Data Dictionary Export -----------------------------------------------------
-with tabs[16]:
+if nav_page == "Data Dictionary Export":
     with tab_guard('Data Dictionary Export'):
         st.subheader("Auto-generated data dictionary")
         st.caption(
@@ -3274,10 +4690,17 @@ with tabs[16]:
                 help="Excel export needs a writer library — run: pip install openpyxl",
             )
         else:
-            dd_health_df = run_health_checks(model)
-            dd_naming_df = lint_naming(model)
-            dd_unused_df = find_unused_columns(model)
-            excel_bytes = build_data_dictionary_excel(model, dd_health_df, dd_naming_df, dd_unused_df)
+            # Reused from the single centralised scan, so the workbook can
+            # never disagree with what the audit sections are showing.
+            excel_bytes = build_data_dictionary_excel(
+                model, health_df, naming_df, unused_df,
+                extra_sheets=[
+                    ("Compression Advice", encoding_df),
+                    ("Fabric Readiness", fabric_df),
+                    ("Taxonomy Issues", taxonomy_issues),
+                    ("RLS Exposure", rls_summary_df),
+                ],
+            )
             st.download_button(
                 "⬇ Download Data Dictionary (.xlsx)", excel_bytes,
                 file_name=f"{_slug(model.get('model_name') or 'model')}_data_dictionary.xlsx",
@@ -3286,7 +4709,7 @@ with tabs[16]:
             )
 
 # --- Theme -------------------------------------------------------------------
-with tabs[17]:
+if nav_page == "Theme":
     with tab_guard('Theme'):
         st.subheader("Report theme")
         st.caption(
@@ -3347,6 +4770,299 @@ with tabs[17]:
                     file_name=f"{_slug(theme['name'], 'theme')}.json",
                     mime="application/json", key="dl_theme", width="stretch",
                 )
+
+# --- Display Folders ----------------------------------------------------------
+if nav_page == "Display Folders":
+    with tab_guard("Display Folders"):
+        st.subheader("Display folder taxonomy")
+        st.caption(
+            "How the model looks in the **Fields** pane of Power BI Desktop. This is the "
+            "only part of a semantic model a business user ever navigates directly, so a "
+            "sloppy taxonomy costs more support time than a slow measure does."
+        )
+        if not taxonomy_issues.empty:
+            counts = severity_counts(taxonomy_issues)
+            st.warning(
+                f"{len(taxonomy_issues)} taxonomy issue(s) — "
+                + ", ".join(f"{n} {s.lower()}" for s, n in counts.items()),
+                icon="🗂️",
+            )
+            show_table(taxonomy_issues, "Taxonomy Issues", height=240, key="tax_issues")
+        else:
+            st.success("No orphaned measures or visible join keys found.", icon="✅")
+
+        show_hidden = st.checkbox(
+            "Show hidden objects", value=False, key="tax_hidden",
+            help="Hidden columns don't appear in the Fields pane — off by default so this "
+                 "view matches what a report author actually sees.",
+        )
+        st.markdown("#### Folder tree")
+        if not taxonomy_tree:
+            st.info("No measures or columns to organise.")
+        for table in sorted(taxonomy_tree):
+            folders = taxonomy_tree[table]
+            visible_total = sum(
+                1 for items in folders.values() for i in items if show_hidden or not i["hidden"]
+            )
+            if not visible_total:
+                continue
+            with st.expander(f"📁 {table}  ·  {visible_total} object(s)"):
+                for folder in sorted(folders, key=lambda f: (f == "", f.lower())):
+                    items = [i for i in folders[folder] if show_hidden or not i["hidden"]]
+                    if not items:
+                        continue
+                    if folder:
+                        st.markdown(f"**📂 {html.escape(folder)}**")
+                    else:
+                        st.markdown("**(no display folder)**")
+                    lines = []
+                    for i in sorted(items, key=lambda x: (x["kind"], x["name"].lower())):
+                        icon = "📐" if i["kind"] == "measure" else "🧱"
+                        suffix = " *(hidden)*" if i["hidden"] else ""
+                        lines.append(f"{icon} {i['name']}{suffix}")
+                    st.markdown(
+                        "<div style='columns:3;font-size:.85rem;color:#475569'>"
+                        + "".join(f"<div>{html.escape(l)}</div>" for l in lines)
+                        + "</div>",
+                        unsafe_allow_html=True,
+                    )
+
+# --- Compression Advisor ------------------------------------------------------
+if nav_page == "Compression Advisor":
+    with tab_guard("Compression Advisor"):
+        st.subheader("VertiPaq compression & encoding advisor")
+        st.caption(
+            "Model Size tells you *where* the memory went; this tells you *what to do about "
+            "it*. Every row is a column big enough to matter, with the specific change that "
+            "would shrink it. Distinct counts are estimated from VertiPaq's dictionary bit "
+            "width — a .vpax carries no row data, so treat them as an order of magnitude."
+        )
+        if encoding_df.empty:
+            st.success(
+                "No storage problems found on the columns large enough to be worth tuning — "
+                "or this export has no VertiPaq statistics (Tabular Editor exports often "
+                "omit them; use DAX Studio ➜ Export Metadata for the full picture).",
+                icon="✅",
+            )
+        else:
+            counts = severity_counts(encoding_df)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("🔴 High", counts.get("High", 0), help="Large, clearly fixable waste.")
+            c2.metric("🟠 Medium", counts.get("Medium", 0))
+            c3.metric("Columns advised", len(encoding_df))
+            show_table(encoding_df, "Compression Advice", height=440, key="encoding")
+            with st.expander("How to act on these"):
+                st.markdown(
+                    "- **HASH on a numeric column** — set `EncodingHint = Value` in Tabular "
+                    "Editor, or fix the source so the column is a clean integer. Removes the "
+                    "dictionary outright.\n"
+                    "- **NOSPLIT with few distinct values** — add an `ORDER BY` on that column "
+                    "to the source query (or `Table.Sort` in M) so run-length encoding can "
+                    "collapse the runs. Sort by the *lowest*-cardinality column first.\n"
+                    "- **Dictionary over 60%** — split the column (date from time, prefix from "
+                    "suffix) or round decimals to reporting precision. High-cardinality text "
+                    "is almost always the single biggest line in a large model.\n"
+                    "- **Hidden but available in MDX** — the *Fix Script (C#)* section "
+                    "generates the `IsAvailableInMdx = false` calls for you."
+                )
+
+# --- Fabric Readiness ---------------------------------------------------------
+if nav_page == "Fabric Readiness":
+    with tab_guard("Fabric Readiness"):
+        st.subheader("Microsoft Fabric / Direct Lake readiness")
+        st.caption(
+            "Direct Lake reads Parquet straight out of OneLake, so anything that needs the "
+            "import engine to transform data at load time isn't supported — and when one is "
+            "present, queries silently fall back to DirectQuery and the speed advantage "
+            "disappears. This flags the blockers that a .vpax can actually see."
+        )
+        counts = severity_counts(fabric_df)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("🔴 Blockers", counts.get("High", 0), help="Would prevent or break Direct Lake.")
+        c2.metric("🟠 Warnings", counts.get("Medium", 0))
+        c3.metric("Checks run", len(fabric_df))
+        if counts.get("High"):
+            st.error(
+                "This model would **not** run cleanly in Direct Lake today. Work the high-"
+                "severity rows first — calculated tables and columns have to move upstream.",
+                icon="🔴",
+            )
+        elif counts.get("Medium"):
+            st.warning("No hard blockers, but some items need attention before migrating.", icon="🟠")
+        else:
+            st.success("No Direct Lake blockers detected in this export.", icon="✅")
+        show_table(fabric_df, "Fabric Readiness", height=420, key="fabric")
+        st.info(
+            "**What this can't see:** whether the source Delta tables are V-Order optimised, "
+            "the size and count of Parquet row groups, or the capacity SKU you're targeting. "
+            "Confirm those in the Fabric portal before committing to a migration.",
+            icon="ℹ️",
+        )
+
+# --- Model Compare ------------------------------------------------------------
+if nav_page == "Model Compare":
+    with tab_guard("Model Compare"):
+        st.subheader("Model compare & metric drift")
+        st.caption(
+            "The failure mode this catches: someone connects to the certified model, adds "
+            "local measures in a composite model, and one of them reuses a certified "
+            "measure's name with different DAX. The name still matches the single source of "
+            "truth — the number no longer does, and nothing in Power BI warns anyone."
+        )
+        if baseline_model is None:
+            st.info(
+                "👈 Upload the **certified/baseline .vpax** under *Compare against a baseline* "
+                "in the sidebar. The model you already loaded is treated as the working copy.",
+                icon="🆚",
+            )
+        else:
+            diff = compare_models(baseline_model, model)
+            drift, added, removed = diff["drift"], diff["added"], diff["removed"]
+            b_name = baseline_model.get("model_name") or "baseline"
+            st.markdown(
+                f"Comparing **{html.escape(str(model.get('model_name') or 'this model'))}** "
+                f"against baseline **{html.escape(str(b_name))}**."
+            )
+            k = st.columns(4)
+            k[0].metric("🔴 Drifted measures", int((drift["Change"] == "DAX changed").sum()) if not drift.empty else 0,
+                        help="Same name, different DAX — the single source of truth is broken.")
+            k[1].metric("Missing", len(removed), help="In the baseline, absent here.")
+            k[2].metric("Extra", len(added), help="Local measures not in the certified set.")
+            k[3].metric("Structure changes", len(diff["structure"]))
+
+            if drift.empty and added.empty and removed.empty:
+                st.success("Every measure matches the baseline, name and DAX.", icon="✅")
+
+            if not drift.empty:
+                st.markdown("#### 🔴 Metric drift")
+                show_table(
+                    drift[["Measure", "Change", "Severity", "Baseline Table", "Compared Table"]],
+                    "Metric Drift", height=260, key="drift",
+                )
+                pick = st.selectbox("Inspect the DAX for", drift["Measure"].tolist(), key="drift_pick")
+                row = drift[drift["Measure"] == pick].iloc[0]
+                d1, d2 = st.columns(2)
+                with d1:
+                    st.markdown(f"**Baseline** — `{row['Baseline Table']}`")
+                    st.code(row["Baseline DAX"] or "(empty)", language="dax")
+                with d2:
+                    st.markdown(f"**This model** — `{row['Compared Table']}`")
+                    st.code(row["Compared DAX"] or "(empty)", language="dax")
+                st.caption(
+                    "Comments and whitespace are ignored when deciding whether DAX changed, "
+                    "so only real logic differences appear here."
+                )
+
+            if not removed.empty:
+                st.markdown("#### Missing from this model")
+                show_table(removed[["Measure", "Table", "Severity", "Note"]],
+                           "Missing Measures", height=220, key="cmp_removed")
+            if not added.empty:
+                st.markdown("#### Only in this model")
+                show_table(added[["Measure", "Table", "Severity", "Note"]],
+                           "Extra Measures", height=220, key="cmp_added")
+            if not diff["structure"].empty:
+                with st.expander(f"Structural differences ({len(diff['structure'])})"):
+                    show_table(diff["structure"], "Structure Diff", height=320, key="cmp_struct")
+
+# --- RLS Simulator ------------------------------------------------------------
+if nav_page == "RLS Simulator":
+    with tab_guard("RLS Simulator"):
+        st.subheader("Row-level security propagation simulator")
+        st.caption(
+            "A role's filter travels the same path any filter does: down the one side to the "
+            "many side, and back up only across a bi-directional relationship. So securing a "
+            "dimension protects the facts hanging off it — but securing a fact protects "
+            "nothing else, and a filter that needs to travel many→one across a single-"
+            "direction relationship is trapped. That's the silent failure: the role looks "
+            "configured and the data isn't secured."
+        )
+        if rls_summary_df.empty:
+            st.info(
+                "No RLS roles are defined in this model — every user who can open the report "
+                "sees every row. That may be correct; it's worth confirming it's deliberate."
+            )
+        else:
+            worst = severity_counts(rls_summary_df)
+            if worst.get("High"):
+                st.error(
+                    f"{worst['High']} role(s) leave related tables unsecured because the "
+                    "filter can't cross a single-direction relationship.", icon="🔴",
+                )
+            st.markdown("#### Per-role verdict")
+            show_table(rls_summary_df, "RLS Summary", height=240, key="rls_summary")
+
+            roles_list = sorted(rls_sim_df["Role"].dropna().unique().tolist())
+            picked_role = st.selectbox("Trace filter propagation for", roles_list, key="rls_role")
+            trace = rls_sim_df[rls_sim_df["Role"] == picked_role]
+            only_problems = st.checkbox(
+                "Show only unsecured related tables", value=True, key="rls_only_problems",
+                help="Tables with no relationship path to the secured table are expected to be "
+                     "unfiltered — hiding them keeps the real gaps visible.",
+            )
+            view = trace[trace["Severity"] == "High"] if only_problems else trace
+            if view.empty:
+                st.success(
+                    "No trapped filters for this role — every related table is reached.",
+                    icon="✅",
+                )
+            else:
+                show_table(sort_by_severity(view), f"RLS {picked_role}", height=380, key="rls_trace")
+            with st.expander("How to fix a trapped filter"):
+                st.markdown(
+                    "In order of preference:\n\n"
+                    "1. **Secure the dimension, not the fact.** Put the filter on the table "
+                    "that sits on the *one* side; it then flows down to every fact.\n"
+                    "2. **Use a bridge table** for many-to-many security, filtered on the "
+                    "user's identity via `USERPRINCIPALNAME()`.\n"
+                    "3. **Turn on bi-directional cross-filtering for the security role only** "
+                    "(the *Apply security filter in both directions* checkbox) rather than "
+                    "making the relationship bi-directional for everyone.\n\n"
+                    "Note that `USERELATIONSHIP` cannot be used in a measure that queries a "
+                    "table with RLS applied — if a role secures a table your time-intelligence "
+                    "measures reactivate relationships on, those measures will error for that role."
+                )
+            st.info(
+                "This simulates the *filter path only*. It can't evaluate whether a role's DAX "
+                "expression returns the right rows — that needs **View as role** in Power BI "
+                "Desktop against real data.", icon="ℹ️",
+            )
+
+# --- Fix Script (C#) ----------------------------------------------------------
+if nav_page == "Fix Script (C#)":
+    with tab_guard("Fix Script (C#)"):
+        st.subheader("Tabular Editor fix script")
+        st.caption(
+            "Turns the mechanical findings from the audit sections into a runnable C# script "
+            "for Tabular Editor's **Advanced Scripting** window. Everything reversible is "
+            "emitted live; renames are commented out, because renaming an object breaks every "
+            "visual, bookmark and RLS expression that referenced the old name."
+        )
+        opts = st.columns(2)
+        with opts[0]:
+            inc_mdx = st.checkbox("Drop attribute hierarchies on hidden columns", True, key="fs_mdx")
+            inc_keys = st.checkbox("Hide relationship key columns", True, key="fs_keys")
+            inc_fmt = st.checkbox("Set a default format string on unformatted measures", False, key="fs_fmt")
+        with opts[1]:
+            inc_rename = st.checkbox("Naming-convention renames (commented out)", True, key="fs_rename")
+            inc_desc = st.checkbox("Description placeholders (commented out)", False, key="fs_desc")
+
+        script = build_te_script(
+            model, naming_df,
+            include_renames=inc_rename, include_mdx=inc_mdx, include_hide_keys=inc_keys,
+            include_formats=inc_fmt, include_descriptions=inc_desc,
+        )
+        st.code(script, language="csharp")
+        st.download_button(
+            "⬇ Download fix script (.csx)", script.encode("utf-8"),
+            file_name=f"{_slug(model.get('model_name') or 'model')}_fixes.csx",
+            mime="text/plain", key="dl_te_script", width="stretch",
+        )
+        st.warning(
+            "Run this against a **copy** first, and check *Investigate ➜ Impact Analysis* on "
+            "anything you're about to rename. Tabular Editor writes changes straight to the "
+            "model — there's no undo once saved.", icon="⚠️",
+        )
 
 st.markdown(
     f'<div class="app-footer">🧩 VPAX Semantic Model Explorer &nbsp;·&nbsp; <b>{AUTHOR}</b></div>',
