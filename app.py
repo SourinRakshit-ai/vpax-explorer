@@ -46,7 +46,6 @@ _IMPORT_NAME_OVERRIDES = {
     "pandas": "pandas",
     "openpyxl": "openpyxl",
     "xlsxwriter": "xlsxwriter",
-    "python-docx": "docx",
 }
 
 
@@ -451,24 +450,14 @@ def extract_sql(m_expression: str) -> str:
     return "".join(out).strip()
 
 
-@st.cache_data(show_spinner=False)
-def load_report_pages(pbix_bytes: bytes) -> Dict[str, Any]:
-    """Read the real report pages out of a .pbix.
-
-    A .vpax holds the semantic model only - it has no notion of report pages.
-    The page list lives in the `Report/Layout` part of the .pbix, together
-    with the tables and fields each visual binds to.
-    """
-    with zipfile.ZipFile(io.BytesIO(pbix_bytes)) as z:
-        layout_name = next((n for n in z.namelist() if n.rsplit("/", 1)[-1] == "Layout"
-                            and n.startswith("Report")), None)
-        if layout_name is None:
-            raise ValueError(
-                "No 'Report/Layout' part found - this doesn't look like a .pbix "
-                "report (a .pbip/PBIR project stores pages as separate files)."
-            )
-        raw = z.read(layout_name)
-
+def _read_legacy_layout(z: zipfile.ZipFile) -> Optional[Dict[str, Any]]:
+    """Read the classic single `Report/Layout` blob, if this .pbix has one."""
+    layout_name = next(
+        (n for n in z.namelist() if n.rsplit("/", 1)[-1] == "Layout" and n.startswith("Report")), None
+    )
+    if layout_name is None:
+        return None
+    raw = z.read(layout_name)
     # Report/Layout is UTF-16LE in classic .pbix files, UTF-8 in some newer ones.
     for encoding in ("utf-16-le", "utf-8-sig", "utf-8"):
         try:
@@ -478,10 +467,13 @@ def load_report_pages(pbix_bytes: bytes) -> Dict[str, Any]:
             continue
     else:
         raise ValueError("Could not decode Report/Layout as JSON.")
-
     if not isinstance(data, dict):
         raise ValueError("Report/Layout has an unexpected shape (expected a JSON object).")
+    return data
 
+
+def _pages_from_legacy_layout(data: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Dict[str, Set[str]]]]:
+    """Pages + field bindings from the classic single-blob Layout format."""
     rows, fields_by_page = [], {}
     for section in data.get("sections") or []:
         if not isinstance(section, dict):
@@ -509,16 +501,172 @@ def load_report_pages(pbix_bytes: bytes) -> Dict[str, Any]:
             "Hidden": cfg.get("visibility") == 1,
         })
 
-    # Pin the schema so a report with no readable sections stays an *empty*
-    # frame with the right columns instead of a column-less one that would
-    # raise KeyError the moment the UI touches pages["Hidden"].
-    pages = _ensure_columns(pd.DataFrame(rows), [
-        "Order", "Screen / Page Name", "Visuals", "Hidden",
-    ])
+    pages = _ensure_columns(pd.DataFrame(rows), ["Order", "Screen / Page Name", "Visuals", "Hidden"])
     if not pages.empty:
         pages["Hidden"] = pages["Hidden"].fillna(False).astype(bool)
         pages = pages.sort_values("Order", na_position="last").reset_index(drop=True)
-    return {"pages": pages, "fields_by_page": fields_by_page}
+    return pages, fields_by_page
+
+
+def _pages_from_pbir(z: zipfile.ZipFile) -> Optional[Tuple[pd.DataFrame, Dict[str, Dict[str, Set[str]]]]]:
+    """Pages + field bindings from the newer PBIR project format.
+
+    Recent Power BI Desktop versions export reports as a folder tree
+    (`Report/definition/pages/<id>/page.json` + `.../visuals/<id>/visual.json`)
+    instead of one `Report/Layout` blob - a plain .pbix can carry either.
+    Returns None if this .pbix has no PBIR page definitions either.
+    """
+    norm = {n.replace("\\", "/"): n for n in z.namelist()}
+    index_key = next((k for k in norm if k.endswith("Report/definition/pages/pages.json")), None)
+    if index_key is None:
+        return None
+
+    index = _read_json_member(z, norm[index_key])
+    order = list(index.get("pageOrder") or [])
+    prefix = index_key.rsplit("/", 1)[0] + "/"  # ".../Report/definition/pages/"
+    if not order:
+        # No explicit order recorded - fall back to whatever page folders exist.
+        order = sorted({
+            k[len(prefix):].split("/", 1)[0]
+            for k in norm if k.startswith(prefix) and k.endswith("/page.json")
+        })
+
+    rows, fields_by_page = [], {}
+    for ordinal, page_id in enumerate(order):
+        page_key = f"{prefix}{page_id}/page.json"
+        if page_key not in norm:
+            continue
+        page = _read_json_member(z, norm[page_key])
+        name = page.get("displayName") or page.get("name") or page_id
+
+        visual_prefix = f"{prefix}{page_id}/visuals/"
+        visual_keys = [
+            k for k in norm if k.startswith(visual_prefix) and k.rsplit("/", 1)[-1] == "visual.json"
+        ]
+        blob = " ".join(z.read(norm[k]).decode("utf-8-sig", errors="ignore") for k in visual_keys)
+        entities = set(re.findall(r'"Entity"\s*:\s*"([^"]+)"', blob))
+        properties = set(re.findall(r'"Property"\s*:\s*"([^"]+)"', blob))
+        fields_by_page[name] = {"entities": entities, "properties": properties}
+
+        rows.append({
+            "Order": ordinal,
+            "Screen / Page Name": name,
+            "Visuals": len(visual_keys),
+            # A normal visible page simply has no "visibility" key; tooltip/
+            # drill-through/hidden pages carry an explicit non-empty value
+            # (e.g. "HiddenInViewMode").
+            "Hidden": bool(page.get("visibility")),
+        })
+
+    pages = _ensure_columns(pd.DataFrame(rows), ["Order", "Screen / Page Name", "Visuals", "Hidden"])
+    if not pages.empty:
+        pages["Hidden"] = pages["Hidden"].fillna(False).astype(bool)
+        pages = pages.sort_values("Order", na_position="last").reset_index(drop=True)
+    return pages, fields_by_page
+
+
+def _read_pbir_report_json(z: zipfile.ZipFile) -> Optional[Dict[str, Any]]:
+    norm = {n.replace("\\", "/"): n for n in z.namelist()}
+    key = next((k for k in norm if k.endswith("Report/definition/report.json")), None)
+    return _read_json_member(z, norm[key]) if key else None
+
+
+def extract_report_theme(z: zipfile.ZipFile, report_defs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Resolve the report's active theme to its actual JSON bytes.
+
+    The theme reference (`themeCollection.baseTheme` in PBIR, or a top-level
+    `theme`/`resourcePackages` in the classic Layout blob) only names the
+    theme and points at a `resourcePackages` entry for its file path - the
+    same `StaticResources` layout holds both Power BI's built-in ("shared")
+    themes and any theme a user uploaded ("registered") themselves, so both
+    are resolved the same way here.
+    """
+    theme_ref: Optional[Dict[str, Any]] = None
+    resource_items: Dict[str, Dict[str, str]] = {}
+
+    for rd in report_defs:
+        if not isinstance(rd, dict):
+            continue
+        tc = rd.get("themeCollection")
+        if theme_ref is None and isinstance(tc, dict) and isinstance(tc.get("baseTheme"), dict):
+            theme_ref = tc["baseTheme"]
+        if theme_ref is None and isinstance(rd.get("theme"), dict) and rd["theme"].get("name"):
+            theme_ref = {"name": rd["theme"]["name"], "type": "SharedResources"}
+        for pkg in rd.get("resourcePackages") or []:
+            if not isinstance(pkg, dict):
+                continue
+            for item in pkg.get("items") or []:
+                if isinstance(item, dict) and item.get("name"):
+                    resource_items[item["name"]] = {
+                        "path": item.get("path", ""),
+                        "package_type": pkg.get("type") or "",
+                    }
+
+    if theme_ref is None or not theme_ref.get("name"):
+        return {"found": False}
+
+    theme_name = theme_ref["name"]
+    is_custom = str(theme_ref.get("type") or "").lower() != "sharedresources"
+
+    norm = {n.replace("\\", "/"): n for n in z.namelist()}
+    candidate_paths = []
+    item = resource_items.get(theme_name)
+    if item:
+        base = "RegisteredResources" if str(item["package_type"]).lower() != "sharedresources" else "SharedResources"
+        candidate_paths.append(f"Report/StaticResources/{base}/{item['path']}".replace("\\", "/"))
+    # Fall back to the conventional built-in location if the report
+    # definition didn't list the theme in resourcePackages (older schemas).
+    candidate_paths.append(f"Report/StaticResources/SharedResources/BaseThemes/{theme_name}.json")
+
+    matched_key = None
+    for path in candidate_paths:
+        if path in norm:
+            matched_key = norm[path]
+            break
+    if matched_key is None:
+        # Last resort: any part whose filename matches, wherever it lives.
+        matched_key = next((n for n in norm if n.replace("\\", "/").endswith(f"/{theme_name}.json")), None)
+        matched_key = norm.get(matched_key, matched_key) if matched_key else None
+
+    if matched_key is None:
+        return {"found": False, "name": theme_name, "is_custom": is_custom}
+
+    raw = z.read(matched_key)
+    try:
+        theme_json = json.loads(raw.decode("utf-8-sig"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        theme_json = json.loads(raw.decode("utf-8", errors="ignore"))
+
+    return {"found": True, "name": theme_name, "is_custom": is_custom, "json": theme_json, "raw_bytes": raw}
+
+
+@st.cache_data(show_spinner=False)
+def load_report_pages(pbix_bytes: bytes) -> Dict[str, Any]:
+    """Read the real report pages (and active theme) out of a .pbix.
+
+    A .vpax holds the semantic model only - it has no notion of report pages
+    or theming. Pages live either in a single `Report/Layout` blob (classic
+    format) or under `Report/definition/pages/...` (newer PBIR format,
+    produced by recent Power BI Desktop versions) - this reads whichever one
+    the file actually has.
+    """
+    with zipfile.ZipFile(io.BytesIO(pbix_bytes)) as z:
+        legacy = _read_legacy_layout(z)
+        if legacy is not None:
+            pages, fields_by_page = _pages_from_legacy_layout(legacy)
+        else:
+            pbir = _pages_from_pbir(z)
+            if pbir is None:
+                raise ValueError(
+                    "No 'Report/Layout' part or 'Report/definition/pages' found - "
+                    "this doesn't look like a .pbix report."
+                )
+            pages, fields_by_page = pbir
+
+        report_defs = [d for d in (legacy, _read_pbir_report_json(z)) if d is not None]
+        theme = extract_report_theme(z, report_defs)
+
+    return {"pages": pages, "fields_by_page": fields_by_page, "theme": theme}
 
 
 def tables_used_by_page(page_name: str, report: Dict[str, Any], model: Dict[str, Any]) -> Set[str]:
@@ -717,13 +865,49 @@ def _name_column(df: pd.DataFrame, *candidates: str) -> Optional[str]:
     return next((c for c in candidates if c in df.columns), None)
 
 
+def _bytes_to_mb(n: Any) -> Optional[float]:
+    """Bytes -> MB, rounded to 2dp. One column, one unit, no ambiguity."""
+    try:
+        return round(float(n) / (1024.0 * 1024.0), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+_SYSTEM_ROWNUMBER_RE = re.compile(r"^RowNumber-[0-9A-Fa-f-]+$")
+
+
+def _user_facing_columns(columns_df: pd.DataFrame) -> pd.DataFrame:
+    """Drop VertiPaq-internal RowNumber pseudo-columns.
+
+    Every table gets an auto-generated row-number column that exists purely
+    for the storage engine - it's never something a modeler created or would
+    reference, and showing it (as `RowNumber-<guid>`) in size/unused/naming
+    analyses is just noise. `columns_by_table`/`column_tables` (built from
+    Model.bim) already exclude these; `model["columns"]` (built from
+    DaxVpaView.json) doesn't, so callers that iterate it need this filter.
+    """
+    if columns_df.empty:
+        return columns_df
+    mask = pd.Series(True, index=columns_df.index)
+    if "ColumnType" in columns_df.columns:
+        mask &= columns_df["ColumnType"].astype(str).str.lower() != "rownumber"
+    if "IsRowNumber" in columns_df.columns:
+        mask &= ~columns_df["IsRowNumber"].fillna(False).astype(bool)
+    if "ColumnName" in columns_df.columns:
+        mask &= ~columns_df["ColumnName"].astype(str).str.match(_SYSTEM_ROWNUMBER_RE)
+    return columns_df[mask]
+
+
 def build_model_size_summary(model: Dict[str, Any]) -> Dict[str, Any]:
     """Aggregate whatever VertiPaq size/cardinality stats are present.
 
     Degrades field-by-field: an export without VertiPaq stats (or one that
     names them differently) yields fewer sub-results, never a broken table.
+    Every size figure is converted to a single MB column (compressed
+    in-memory VertiPaq size, not file size) - one unit, no ambiguity.
     """
-    tables_df, columns_df = model["tables"], model["columns"]
+    tables_df = model["tables"]
+    columns_df = _user_facing_columns(model["columns"])
     summary: Dict[str, Any] = {"available": False}
 
     table_name_col = _name_column(tables_df, "TableName", "Name")
@@ -732,14 +916,13 @@ def build_model_size_summary(model: Dict[str, Any]) -> Dict[str, Any]:
         sized = tables_df[[table_name_col, table_size_col]].dropna(subset=[table_size_col])
         if not sized.empty:
             summary["available"] = True
-            summary["total_model_size"] = float(pd.to_numeric(sized[table_size_col], errors="coerce").sum())
-            summary["top_tables"] = (
-                sized.assign(**{table_size_col: pd.to_numeric(sized[table_size_col], errors="coerce")})
-                .sort_values(table_size_col, ascending=False)
-                .head(20)
-                .rename(columns={table_name_col: "Table", table_size_col: "Size"})
-                .reset_index(drop=True)
-            )
+            total_bytes = float(pd.to_numeric(sized[table_size_col], errors="coerce").sum())
+            summary["total_model_size_mb"] = _bytes_to_mb(total_bytes)
+            top = sized.assign(**{table_size_col: pd.to_numeric(sized[table_size_col], errors="coerce")})
+            top = top.sort_values(table_size_col, ascending=False).head(20)
+            top[table_size_col] = top[table_size_col].apply(_bytes_to_mb)
+            top = top.rename(columns={table_name_col: "Table", table_size_col: "Size (MB)"})
+            summary["top_tables"] = top.reset_index(drop=True)
 
     col_name_cols = [c for c in (_name_column(columns_df, "TableName"), _name_column(columns_df, "ColumnName")) if c]
     col_size_col = _name_column(columns_df, *_VPA_SIZE_FIELD_CANDIDATES)
@@ -747,13 +930,11 @@ def build_model_size_summary(model: Dict[str, Any]) -> Dict[str, Any]:
         sized = columns_df[col_name_cols + [col_size_col]].dropna(subset=[col_size_col])
         if not sized.empty:
             summary["available"] = True
-            summary["top_columns"] = (
-                sized.assign(**{col_size_col: pd.to_numeric(sized[col_size_col], errors="coerce")})
-                .sort_values(col_size_col, ascending=False)
-                .head(20)
-                .rename(columns={col_size_col: "Size"})
-                .reset_index(drop=True)
-            )
+            top = sized.assign(**{col_size_col: pd.to_numeric(sized[col_size_col], errors="coerce")})
+            top = top.sort_values(col_size_col, ascending=False).head(20)
+            top[col_size_col] = top[col_size_col].apply(_bytes_to_mb)
+            top = top.rename(columns={col_size_col: "Size (MB)"})
+            summary["top_columns"] = top.reset_index(drop=True)
 
     cardinality_col = _name_column(columns_df, *_VPA_CARDINALITY_CANDIDATES)
     if col_name_cols and cardinality_col:
@@ -764,7 +945,7 @@ def build_model_size_summary(model: Dict[str, Any]) -> Dict[str, Any]:
                 sized.assign(**{cardinality_col: pd.to_numeric(sized[cardinality_col], errors="coerce")})
                 .sort_values(cardinality_col, ascending=False)
                 .head(20)
-                .rename(columns={cardinality_col: "Cardinality"})
+                .rename(columns={cardinality_col: "Distinct Values"})
                 .reset_index(drop=True)
             )
 
@@ -774,9 +955,13 @@ def build_model_size_summary(model: Dict[str, Any]) -> Dict[str, Any]:
         breakdown = columns_df[col_name_cols + [data_col, dict_col]].dropna(subset=[data_col, dict_col], how="all")
         if not breakdown.empty:
             summary["available"] = True
-            summary["dict_vs_data"] = breakdown.rename(
-                columns={data_col: "Data Size", dict_col: "Dictionary Size"}
+            breakdown = breakdown.copy()
+            breakdown[data_col] = breakdown[data_col].apply(_bytes_to_mb)
+            breakdown[dict_col] = breakdown[dict_col].apply(_bytes_to_mb)
+            breakdown = breakdown.rename(
+                columns={data_col: "Data Size (MB)", dict_col: "Dictionary Size (MB)"}
             ).reset_index(drop=True)
+            summary["dict_vs_data"] = breakdown
 
     encoding_col = _name_column(columns_df, *_VPA_ENCODING_CANDIDATES)
     if encoding_col:
@@ -1715,9 +1900,11 @@ def find_unused_columns(model: Dict[str, Any]) -> pd.DataFrame:
 
     A column name shared by more than one table can't be attributed to a
     specific table from an unqualified [Ref] alone, so those are reported as
-    ambiguous rather than silently marked used or unused.
+    ambiguous rather than silently marked used or unused. VertiPaq's internal
+    RowNumber pseudo-columns are excluded - they're never real modeling
+    objects, so "unused" doesn't mean anything for them.
     """
-    columns_df = model["columns"]
+    columns_df = _user_facing_columns(model["columns"])
     if columns_df.empty or "TableName" not in columns_df.columns or "ColumnName" not in columns_df.columns:
         return _ensure_columns(pd.DataFrame(), ["Table", "Column", "Status"])
 
@@ -1741,37 +1928,59 @@ def find_unused_columns(model: Dict[str, Any]) -> pd.DataFrame:
     return _ensure_columns(pd.DataFrame(rows), ["Table", "Column", "Status"])
 
 
-def impact_of(target_kind: str, target_name: str, model: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
+def _column_ref_matcher(table: str, column: str) -> "re.Pattern[str]":
+    """Match an explicit, table-qualified reference to one exact column.
+
+    Column names are frequently reused across tables (e.g. a fact and a
+    dimension both having a "Key" column), so matching by column name alone
+    can't tell which table a bare `[Key]` means. Only the qualified forms
+    (`'Table'[Column]` or `Table[Column]`) are counted - deliberately
+    conservative, since an unqualified reference elsewhere can't be safely
+    attributed to one table without a real DAX engine resolving row context.
+    """
+    t, c = re.escape(table), re.escape(column)
+    parts = [rf"'{t}'\s*\[{c}\]"]
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table):
+        parts.append(rf"(?<![A-Za-z0-9_]){t}\s*\[{c}\]")
+    return re.compile("|".join(parts))
+
+
+def impact_of(
+    target_kind: str, target_name: str, model: Dict[str, Any], table_name: Optional[str] = None
+) -> Dict[str, pd.DataFrame]:
     """Everything that references a table or column, for pre-change review.
 
-    `target_kind` is "table" or "column". For "column", a DAX reference that
-    isn't table-qualified is matched by name only when it resolves
-    unambiguously - see `find_referenced_columns`.
+    `target_kind` is "table" or "column". For "column", `table_name` pins
+    down *which* table's column is meant, since column names aren't unique
+    across tables - see `_column_ref_matcher`.
     """
     measures_df, calc_df, rel_df = model["measures"], model["calc_columns"], model["relationships"]
-    table_names, column_tables, measure_names = model["all_table_names"], model["column_tables"], model["measure_names"]
-
-    def touches(expr: Any) -> bool:
-        expr = str(expr or "")
-        if not expr:
-            return False
-        if target_kind == "table":
-            return target_name in find_referenced_tables(expr, table_names)
-        return any(c == target_name for _, c in find_referenced_columns(expr, column_tables, measure_names))
-
-    measure_hits = measures_df[measures_df["MeasureExpression"].apply(touches)].reset_index(drop=True)
-    calc_hits = calc_df[calc_df["ColumnExpression"].apply(touches)].reset_index(drop=True)
+    table_names = model["all_table_names"]
 
     if target_kind == "table":
+        def touches(expr: Any) -> bool:
+            expr = str(expr or "")
+            return bool(expr) and target_name in find_referenced_tables(expr, table_names)
+
         rel_hits = rel_df[
             (rel_df["From Table"] == target_name) | (rel_df["To Table"] == target_name)
         ].reset_index(drop=True)
         neighbours = sorted(_adjacency(rel_df).get(target_name, set()))
     else:
+        pattern = _column_ref_matcher(table_name or "", target_name)
+
+        def touches(expr: Any) -> bool:
+            expr = str(expr or "")
+            return bool(expr) and bool(pattern.search(expr))
+
         rel_hits = rel_df[
-            (rel_df["From Column"] == target_name) | (rel_df["To Column"] == target_name)
+            ((rel_df["From Table"] == table_name) & (rel_df["From Column"] == target_name))
+            | ((rel_df["To Table"] == table_name) & (rel_df["To Column"] == target_name))
         ].reset_index(drop=True)
         neighbours = []
+
+    measure_hits = measures_df[measures_df["MeasureExpression"].apply(touches)].reset_index(drop=True)
+    calc_hits = calc_df[calc_df["ColumnExpression"].apply(touches)].reset_index(drop=True)
 
     related_df = pd.DataFrame({"Related Table": neighbours}) if neighbours else _ensure_columns(
         pd.DataFrame(), ["Related Table"]
@@ -1828,6 +2037,27 @@ def find_cycles(graph: Dict[str, Set[str]]) -> List[List[str]]:
         if color.get(node, WHITE) == WHITE:
             visit(node)
     return cycles
+
+
+def build_measure_dependency_table(graph: Dict[str, Set[str]]) -> pd.DataFrame:
+    """One row per measure: what it calls, and what calls it back.
+
+    This is the plain "which measure is used to build which" answer - the
+    diagram is a visual on top of the same data, not a replacement for it.
+    """
+    used_by: Dict[str, Set[str]] = {n: set() for n in graph}
+    for name, calls in graph.items():
+        for called in calls:
+            used_by.setdefault(called, set()).add(name)
+
+    rows = []
+    for name in sorted(graph):
+        rows.append({
+            "Measure": name,
+            "Depends On": ", ".join(sorted(graph.get(name, set()))),
+            "Used By": ", ".join(sorted(used_by.get(name, set()))),
+        })
+    return _ensure_columns(pd.DataFrame(rows), ["Measure", "Depends On", "Used By"])
 
 
 def build_measure_dependency_dot(graph: Dict[str, Set[str]], focus: Optional[str] = None) -> str:
@@ -1890,6 +2120,25 @@ def run_health_checks(model: Dict[str, Any]) -> pd.DataFrame:
     def add(rule: str, obj: str, severity: str, message: str) -> None:
         rows.append({"Rule": rule, "Object": obj, "Severity": severity, "Message": message})
 
+    meas_df_all = model["measures"]
+    if "MeasureName" in meas_df_all.columns:
+        names = meas_df_all["MeasureName"].dropna().astype(str)
+        for name in sorted(names[names.duplicated(keep=False)].unique()):
+            add(
+                "Duplicate measure name", name, "High",
+                "Another measure elsewhere in the model shares this exact name — likely "
+                "copy-pasted logic under an identical name instead of reused, and confusing "
+                "for anyone trying to report against it.",
+            )
+
+    measure_graph = build_measure_graph(model)
+    for cycle in find_cycles(measure_graph):
+        add(
+            "Circular measure reference", " → ".join(cycle), "High",
+            "These measures call each other in a loop and can never fully evaluate — this is a "
+            "correctness bug, not a style preference.",
+        )
+
     rel_df = model["relationships"]
     for _, r in rel_df[rel_df["Cross Filter Direction"] == "Both"].iterrows():
         add(
@@ -1906,7 +2155,7 @@ def run_health_checks(model: Dict[str, Any]) -> pd.DataFrame:
                 "No row-context/relationship functions detected — this may be cheaper to compute in Power Query/SQL.",
             )
 
-    columns_df = model["columns"]
+    columns_df = _user_facing_columns(model["columns"])
     cardinality_col = _name_column(columns_df, *_VPA_CARDINALITY_CANDIDATES)
     if cardinality_col and {"TableName", "ColumnName"}.issubset(columns_df.columns):
         key_pairs = set()
@@ -1923,7 +2172,7 @@ def run_health_checks(model: Dict[str, Any]) -> pd.DataFrame:
             val = pd.to_numeric(val, errors="coerce")
             if pd.notna(val) and val > 1_000_000:
                 add(
-                    "High-cardinality relationship key", f"{table}[{col}]", "Medium",
+                    "High-cardinality relationship key", f"{table}[{col}]", "High",
                     f"Cardinality ~{int(val):,} — large key columns increase model size and slow joins.",
                 )
     else:
@@ -1978,13 +2227,38 @@ def _detect_casing(name: str) -> str:
     return "Other/mixed"
 
 
+def _split_words(name: str) -> List[str]:
+    """Break a name into words regardless of its current casing convention."""
+    s = re.sub(r"[_\-]+", " ", name)
+    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", s)  # camelCase/PascalCase boundary
+    s = re.sub(r"(?<=[A-Za-z])(?=[0-9])", " ", s)
+    return [w for w in s.split() if w]
+
+
+def _convert_casing(name: str, convention: str) -> Optional[str]:
+    """Render `name` in the given convention, e.g. 'Sale Amt' -> 'sale_amt'."""
+    words = _split_words(name)
+    if not words:
+        return None
+    if convention == "snake_case":
+        return "_".join(w.lower() for w in words)
+    if convention == "PascalCase":
+        return "".join(w.capitalize() for w in words)
+    if convention == "camelCase":
+        return words[0].lower() + "".join(w.capitalize() for w in words[1:])
+    if convention == "Title Case With Spaces":
+        return " ".join(w.capitalize() for w in words)
+    return None
+
+
 def lint_naming(model: Dict[str, Any]) -> pd.DataFrame:
     """Flag inconsistent casing across measures, tables, and columns.
 
     Pure string heuristics, no DAX parsing. A convention is only flagged as
     inconsistent within its own group (e.g. a table's own columns) since
     different tables in the same model often use different, internally
-    consistent conventions.
+    consistent conventions. VertiPaq's internal RowNumber pseudo-columns are
+    excluded - their auto-generated GUID names aren't a naming decision.
     """
     rows: List[Dict[str, str]] = []
 
@@ -1995,12 +2269,20 @@ def lint_naming(model: Dict[str, Any]) -> pd.DataFrame:
             conventions = [_detect_casing(n) for n in names]
             dominant = pd.Series(conventions).value_counts().index[0]
             for name, conv in zip(names, conventions):
-                if conv != dominant:
-                    rows.append({
-                        "Object Type": obj_type, "Table": group, "Name": name,
-                        "Detected Convention": conv,
-                        "Suggestion": f"Most {obj_type.lower()}s on {group} use {dominant} — consider matching it.",
-                    })
+                if conv == dominant:
+                    continue
+                suggested = _convert_casing(name, dominant)
+                if suggested and suggested != name:
+                    suggestion = (
+                        f"Most {obj_type.lower()}s on {group} use {dominant} — "
+                        f"consider renaming to `{suggested}`."
+                    )
+                else:
+                    suggestion = f"Most {obj_type.lower()}s on {group} use {dominant} — consider matching it."
+                rows.append({
+                    "Object Type": obj_type, "Table": group, "Name": name,
+                    "Detected Convention": conv, "Suggestion": suggestion,
+                })
 
     tables_df = model["tables"]
     table_name_col = _name_column(tables_df, "TableName", "Name")
@@ -2015,7 +2297,7 @@ def lint_naming(model: Dict[str, Any]) -> pd.DataFrame:
             groups.setdefault(str(r["TableName"]), []).append(str(r["MeasureName"]))
         scan("Measure", groups)
 
-    columns_df = model["columns"]
+    columns_df = _user_facing_columns(model["columns"])
     if {"TableName", "ColumnName"}.issubset(columns_df.columns):
         groups = {}
         for _, r in columns_df.dropna(subset=["ColumnName"]).iterrows():
@@ -2074,74 +2356,88 @@ def _excel_engine() -> Optional[str]:
 EXCEL_ENGINE = _excel_engine()
 
 
-def _docx_available() -> bool:
-    try:
-        import docx  # noqa: F401
-        return True
-    except ImportError:
-        return False
+def build_formulas_sheet(model: Dict[str, Any]) -> pd.DataFrame:
+    """Every measure and calculated column in one list, each row tagged with
+    its Type - so "what DAX exists in this model" is answered by one sheet
+    instead of cross-referencing two. Measures are listed first, then
+    calculated columns, matching how most modelers think about a model
+    (measures are the primary calculation layer; calculated columns are the
+    exception).
+    """
+    meas_df, calc_df = model["measures"], model["calc_columns"]
+    rows: List[Dict[str, str]] = []
+
+    for _, r in meas_df.iterrows():
+        rows.append({
+            "Type": "Measure",
+            "Table": r.get("TableName", ""),
+            "Name": r.get("MeasureName", ""),
+            "Expression": r.get("MeasureExpression", ""),
+            "DataType": r.get("DataType", ""),
+            "FormatString": r.get("FormatString", ""),
+            "Description": r.get("Description", ""),
+        })
+    for _, r in calc_df.iterrows():
+        rows.append({
+            "Type": "Calculated Column",
+            "Table": r.get("TableName", ""),
+            "Name": r.get("ColumnName", ""),
+            "Expression": r.get("ColumnExpression", ""),
+            "DataType": r.get("DataType", ""),
+            "FormatString": "",
+            "Description": "",
+        })
+
+    return _ensure_columns(
+        pd.DataFrame(rows),
+        ["Type", "Table", "Name", "Expression", "DataType", "FormatString", "Description"],
+    )
 
 
-DOCX_AVAILABLE = _docx_available()
-
-
-def build_data_dictionary_docx(
+def build_data_dictionary_excel(
     model: Dict[str, Any],
     health_df: pd.DataFrame,
     naming_df: pd.DataFrame,
     unused_df: pd.DataFrame,
 ) -> bytes:
-    """One-click data dictionary: model structure plus health/naming/unused findings.
+    """One workbook, one sheet per topic - the whole model plus this app's
+    health/naming/unused-object findings, in the format people actually want
+    to filter, pivot, and share: Excel, not a Word doc.
 
     Diagrams aren't embedded - the app's ER and measure-dependency diagrams
-    are rendered entirely client-side (viz.js in the browser), and there's
-    no server-side Graphviz rendering path to reuse here. Text/tables only;
-    embedding diagrams would need a separate server-side render step.
+    are rendered entirely client-side (viz.js in the browser), and there's no
+    server-side render path to produce an image from here.
     """
-    import docx
+    if EXCEL_ENGINE is None:
+        raise RuntimeError("No Excel writer installed (pip install openpyxl)")
 
-    doc = docx.Document()
-    doc.add_heading(model.get("model_name") or "Data Dictionary", level=0)
-    doc.add_paragraph("Generated by VPAX Semantic Model Explorer.")
-
-    def add_section(title: str, df: pd.DataFrame, max_rows: int = 500) -> None:
-        doc.add_heading(title, level=1)
-        if df.empty:
-            doc.add_paragraph("None found.")
-            return
-        view = df.head(max_rows)
-        table = doc.add_table(rows=1, cols=len(view.columns))
-        table.style = "Light Grid Accent 1"
-        for i, col in enumerate(view.columns):
-            table.rows[0].cells[i].text = str(col)
-        for _, row in view.iterrows():
-            cells = table.add_row().cells
-            for i, col in enumerate(view.columns):
-                cells[i].text = _stringify_cell(row[col])
-        if len(df) > max_rows:
-            doc.add_paragraph(
-                f"… {len(df) - max_rows} more rows omitted for brevity; "
-                "see the tab's CSV/Excel export for the full list."
-            )
-
-    add_section("Tables", model["tables"])
-    add_section("Columns", model["columns"])
-    add_section("Measures", model["measures"])
-    add_section("Calculated Columns", model["calc_columns"])
-    add_section("Relationships", model["relationships"])
-    add_section("Power Query (SQL)", model["power_query"])
-    if not model["roles"].empty:
-        add_section("Security Roles (RLS)", model["roles"])
-    if not model["perspectives"].empty:
-        add_section("Perspectives", model["perspectives"])
-    if not model["date_tables"].empty:
-        add_section("Date Tables", model["date_tables"])
-    add_section("Model Health Findings", health_df)
-    add_section("Naming Convention Findings", naming_df)
-    add_section("Unused Column Candidates", unused_df)
+    sheets: List[Tuple[str, pd.DataFrame]] = [
+        ("Tables", model["tables"]),
+        ("Columns", model["columns"]),
+        ("Measures & Calc Columns", build_formulas_sheet(model)),
+        ("Relationships", model["relationships"]),
+        ("Power Query (SQL)", model["power_query"]),
+        ("Roles (RLS)", model["roles"]),
+        ("Perspectives", model["perspectives"]),
+        ("Date Tables", model["date_tables"]),
+        ("Model Health", health_df),
+        ("Naming Conventions", naming_df),
+        ("Unused Columns", unused_df),
+    ]
 
     buf = io.BytesIO()
-    doc.save(buf)
+    with pd.ExcelWriter(buf, engine=EXCEL_ENGINE) as writer:
+        used_names: Set[str] = set()
+        for name, df in sheets:
+            safe_name = re.sub(r"[:\\/?*\[\]]", "-", name)[:31] or "Sheet1"
+            base, i = safe_name, 2
+            while safe_name in used_names:
+                suffix = f" ({i})"
+                safe_name = base[: 31 - len(suffix)] + suffix
+                i += 1
+            used_names.add(safe_name)
+            out_df = df if not df.empty else pd.DataFrame([{"Info": "None found."}])
+            _safe(out_df).to_excel(writer, index=False, sheet_name=safe_name)
     return buf.getvalue()
 
 
@@ -2298,6 +2594,7 @@ tabs = st.tabs([
     "📦 Model Size", "🧹 Unused Objects", "🔎 Impact Analysis",
     "📊 Measure Dependencies", "✅ Model Health", "🔤 Naming Conventions",
     "📅 Date Table Check", "🔐 Security & Perspectives", "📄 Data Dictionary Export",
+    "🎨 Theme",
 ])
 
 # --- Dashboard Screens ----------------------------------------------------
@@ -2743,9 +3040,14 @@ with tabs[8]:
     with tab_guard('Model Size'):
         st.subheader("Model size & VertiPaq statistics")
         st.caption(
-            "Surfaces whatever VertiPaq-Analyzer size/cardinality stats this .vpax export "
-            "captured. Field names vary by export tool/version, so this only shows what's "
-            "actually present — nothing here is guessed."
+            "**What this is:** Power BI/Analysis Services loads your model into an in-memory "
+            "column store called VertiPaq, and this .vpax export carries that engine's own "
+            "size/cardinality stats per table and column. **Why it matters:** if your model "
+            "feels slow or your .pbix is large, the tables/columns below are exactly where the "
+            "memory is going — the usual fixes are removing unused columns (see the Unused "
+            "Objects tab), reducing cardinality on high-distinct-value columns, or disabling "
+            "columns entirely in favour of a measure. All sizes are shown in MB (compressed "
+            "in-memory size, not file size)."
         )
         size_summary = build_model_size_summary(model)
         if not size_summary.get("available"):
@@ -2755,22 +3057,27 @@ with tabs[8]:
                 "Metadata, or Tabular Editor's Vertipaq Analyzer)."
             )
         else:
-            if "total_model_size" in size_summary:
-                st.metric("Total model size (sum of table sizes)", f'{size_summary["total_model_size"]:,.0f}')
+            if "total_model_size_mb" in size_summary:
+                st.metric("Total model size", f'{size_summary["total_model_size_mb"]:,.1f} MB')
             if "top_tables" in size_summary:
-                st.markdown("**Top tables by size**")
+                st.markdown("**Top tables by size (MB)**")
                 show_table(size_summary["top_tables"], "Top Tables By Size", height=320, key="vpa_tables")
             if "top_columns" in size_summary:
-                st.markdown("**Top columns by size**")
+                st.markdown("**Top columns by size (MB)** — biggest opportunities to shrink the model")
                 show_table(size_summary["top_columns"], "Top Columns By Size", height=320, key="vpa_columns")
             if "top_cardinality" in size_summary:
-                st.markdown("**Highest-cardinality columns**")
+                st.markdown("**Highest-cardinality columns** (count of distinct values)")
                 show_table(size_summary["top_cardinality"], "Top Cardinality Columns", height=320, key="vpa_cardinality")
             if "dict_vs_data" in size_summary:
-                st.markdown("**Dictionary vs. data size**")
+                st.markdown(
+                    "**Dictionary vs. data size (MB)** — a column's Dictionary Size holds its "
+                    "distinct values; Data Size holds the per-row encoded pointers into that "
+                    "dictionary. A dictionary much larger than the data size usually means the "
+                    "column has too many distinct values for how it's being used."
+                )
                 show_table(size_summary["dict_vs_data"], "Dictionary Vs Data Size", height=320, key="vpa_dict")
             if "encoding_breakdown" in size_summary:
-                st.markdown("**Encoding breakdown**")
+                st.markdown("**Encoding breakdown** — how many columns use each VertiPaq encoding")
                 show_table(size_summary["encoding_breakdown"], "Encoding Breakdown", height=220, key="vpa_encoding")
 
 # --- Unused Objects ---------------------------------------------------------
@@ -2798,32 +3105,67 @@ with tabs[10]:
         st.subheader("What references this table or column?")
         st.caption(
             "Pick a table or column to see every measure, calculated column, and relationship "
-            "that touches it before you rename or delete it."
+            "that touches it before you rename or delete it. Column lookups count only explicit "
+            "`'Table'[Column]`-qualified DAX references, since the same column name often exists "
+            "on more than one table (e.g. a join key shared by a fact and a dimension) — that's "
+            "why you pick the table first."
         )
         target_kind = st.radio("Look up a", ["Table", "Column"], horizontal=True, key="impact_kind")
-        options = model["all_table_names"] if target_kind == "Table" else sorted(model["column_tables"].keys())
-        if not options:
-            st.info("No tables/columns found in this model.")
+
+        result = None
+        label = ""
+        if target_kind == "Table":
+            options = model["all_table_names"]
+            if not options:
+                st.info("No tables found in this model.")
+            else:
+                target_name = st.selectbox("Choose a table", options, key="impact_target_table")
+                result = impact_of("table", target_name, model)
+                label = target_name
         else:
-            target_name = st.selectbox(f"Choose a {target_kind.lower()}", options, key="impact_target")
-            result = impact_of(target_kind.lower(), target_name, model)
-            st.markdown(f"**Measures referencing `{target_name}`** ({len(result['measures'])})")
-            show_table(result["measures"].reset_index(drop=True), f"{target_name} measures", height=260, key="impact_measures")
-            st.markdown(f"**Calculated columns referencing `{target_name}`** ({len(result['calc_columns'])})")
-            show_table(result["calc_columns"].reset_index(drop=True), f"{target_name} calc columns", height=220, key="impact_calc")
-            st.markdown(f"**Relationships involving `{target_name}`** ({len(result['relationships'])})")
-            show_table(result["relationships"].reset_index(drop=True), f"{target_name} relationships", height=220, key="impact_rels")
+            table_options = model["all_table_names"]
+            if not table_options:
+                st.info("No tables found in this model.")
+            else:
+                picked_table = st.selectbox("Table", table_options, key="impact_col_table")
+                cols_df = _user_facing_columns(model["columns"])
+                col_options = []
+                if {"TableName", "ColumnName"}.issubset(cols_df.columns):
+                    col_options = sorted(
+                        cols_df.loc[cols_df["TableName"] == picked_table, "ColumnName"].dropna().unique().tolist(),
+                        key=str,
+                    )
+                if not col_options:
+                    st.info(f"No columns found on **{picked_table}**.")
+                else:
+                    target_name = st.selectbox("Column", col_options, key="impact_col_col")
+                    result = impact_of("column", target_name, model, table_name=picked_table)
+                    label = f"{picked_table}[{target_name}]"
+
+        if result is not None:
+            st.markdown(f"**Measures referencing `{label}`** ({len(result['measures'])})")
+            show_table(result["measures"].reset_index(drop=True), f"{label} measures", height=260, key="impact_measures")
+            st.markdown(f"**Calculated columns referencing `{label}`** ({len(result['calc_columns'])})")
+            show_table(result["calc_columns"].reset_index(drop=True), f"{label} calc columns", height=220, key="impact_calc")
+            st.markdown(f"**Relationships involving `{label}`** ({len(result['relationships'])})")
+            show_table(result["relationships"].reset_index(drop=True), f"{label} relationships", height=220, key="impact_rels")
             if target_kind == "Table" and not result["related_tables"].empty:
                 st.markdown("**Directly related tables**")
-                show_table(result["related_tables"], f"{target_name} related tables", height=180, key="impact_related")
+                show_table(result["related_tables"], f"{label} related tables", height=180, key="impact_related")
 
 # --- Measure Dependencies ----------------------------------------------------
 with tabs[11]:
     with tab_guard('Measure Dependencies'):
         st.subheader("Which measures call other measures")
+        st.caption(
+            "\"Depends On\" is what a measure's own DAX calls; \"Used By\" is every measure that "
+            "calls it. Both are read straight from each measure's expression - no report visuals "
+            "involved. Blank cells just mean that measure neither calls nor is called by another "
+            "measure in this model."
+        )
         graph = build_measure_graph(model)
-        if not graph or not any(graph.values()):
-            st.info("No measure-to-measure references found in this model.")
+        if not graph:
+            st.info("No measures found in this model.")
         else:
             cycles = find_cycles(graph)
             if cycles:
@@ -2831,26 +3173,44 @@ with tabs[11]:
                     f"⚠️ {len(cycles)} circular measure reference(s) found — these can never "
                     "fully evaluate: " + "; ".join(" → ".join(c) for c in cycles[:5])
                 )
-            participating = sorted({n for n, calls in graph.items() if calls} | {c for calls in graph.values() for c in calls})
-            focus_options = ["(whole graph)"] + participating
-            choice = st.selectbox("Focus on a measure (optional)", focus_options, key="measure_graph_focus")
-            focus = None if choice.startswith("(whole") else choice
-            dot = build_measure_dependency_dot(graph, focus=focus)
-            static_diagram_panel(dot, engine="dot", filename="measure_dependencies")
+            dep_table = build_measure_dependency_table(graph)
+            show_table(dep_table, "Measure Dependencies", height=460, key="measure_deps")
+
+            if any(graph.values()):
+                with st.expander("Show as a diagram"):
+                    participating = sorted(
+                        {n for n, calls in graph.items() if calls} | {c for calls in graph.values() for c in calls}
+                    )
+                    focus_options = ["(whole graph)"] + participating
+                    choice = st.selectbox("Focus on a measure (optional)", focus_options, key="measure_graph_focus")
+                    focus = None if choice.startswith("(whole") else choice
+                    dot = build_measure_dependency_dot(graph, focus=focus)
+                    static_diagram_panel(dot, engine="dot", filename="measure_dependencies")
 
 # --- Model Health -------------------------------------------------------------
 with tabs[12]:
     with tab_guard('Model Health'):
         st.subheader("Model health & best-practice checks")
+        st.caption(
+            "A checklist of common Power BI modeling issues, ranked by how much they matter:\n"
+            "- **High** — likely wrong or a real performance risk: circular measure references "
+            "(can never evaluate), duplicate measure names, or a relationship key with millions "
+            "of distinct values.\n"
+            "- **Medium** — a design choice worth double-checking, not necessarily wrong: "
+            "bi-directional relationships can cause ambiguous or double-counted results.\n"
+            "- **Low** — hygiene/documentation gaps that don't affect correctness: missing "
+            "descriptions, inconsistent format strings, or a calculated column that might be "
+            "cheaper to compute upstream in Power Query."
+        )
         health_df = run_health_checks(model)
         if health_df.empty:
             st.info("No health-check findings for this model.")
         else:
             counts = health_df["Severity"].value_counts()
             c1, c2, c3 = st.columns(3)
-            c1.metric("High", int(counts.get("High", 0)))
-            c2.metric("Medium", int(counts.get("Medium", 0)))
-            c3.metric("Low", int(counts.get("Low", 0)))
+            c1.metric("High", int(counts.get("High", 0)), help="Likely wrong or a real performance risk — worth fixing.")
+            c2.metric("Medium", int(counts.get("Medium", 0)), help="A design choice worth double-checking.")
+            c3.metric("Low", int(counts.get("Low", 0)), help="Hygiene/documentation gaps — doesn't affect correctness.")
             show_table(health_df, "Model Health", height=460, key="health")
 
 # --- Naming Conventions -------------------------------------------------------
@@ -2902,27 +3262,91 @@ with tabs[16]:
     with tab_guard('Data Dictionary Export'):
         st.subheader("Auto-generated data dictionary")
         st.caption(
-            "One .docx covering tables, columns, measures, calculated columns, relationships, "
-            "Power Query SQL, security/perspectives, and this app's health/naming/unused-object "
-            "findings. Diagrams aren't embedded — the ER and measure-dependency diagrams render "
-            "client-side only; download them separately from their own tabs."
+            "One Excel workbook, one sheet per topic: tables, columns, measures, calculated "
+            "columns, relationships, Power Query SQL, security/perspectives, and this app's "
+            "health/naming/unused-object findings. Diagrams aren't embedded — the ER and "
+            "measure-dependency diagrams render client-side only; download them separately from "
+            "their own tabs."
         )
-        if not DOCX_AVAILABLE:
+        if EXCEL_ENGINE is None:
             st.button(
-                "⬇ Download Data Dictionary (.docx)", disabled=True, width="stretch",
-                help="Needs python-docx — run: pip install python-docx",
+                "⬇ Download Data Dictionary (.xlsx)", disabled=True, width="stretch",
+                help="Excel export needs a writer library — run: pip install openpyxl",
             )
         else:
             dd_health_df = run_health_checks(model)
             dd_naming_df = lint_naming(model)
             dd_unused_df = find_unused_columns(model)
-            docx_bytes = build_data_dictionary_docx(model, dd_health_df, dd_naming_df, dd_unused_df)
+            excel_bytes = build_data_dictionary_excel(model, dd_health_df, dd_naming_df, dd_unused_df)
             st.download_button(
-                "⬇ Download Data Dictionary (.docx)", docx_bytes,
-                file_name=f"{_slug(model.get('model_name') or 'model')}_data_dictionary.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "⬇ Download Data Dictionary (.xlsx)", excel_bytes,
+                file_name=f"{_slug(model.get('model_name') or 'model')}_data_dictionary.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="dl_data_dictionary", width="stretch",
             )
+
+# --- Theme -------------------------------------------------------------------
+with tabs[17]:
+    with tab_guard('Theme'):
+        st.subheader("Report theme")
+        st.caption(
+            "A .vpax has no styling metadata at all — it's the semantic model only. This reads "
+            "the actual Power BI theme file out of the .pbix (colors, fonts, and sizes for "
+            "titles/headers/labels/callouts) and lets you download it as-is, so it can be "
+            "re-imported into another report via **View ➜ Themes ➜ Browse for themes**."
+        )
+        if report is None:
+            st.info("👈 Upload the matching **.pbix** in the sidebar (*Add report pages*) to read its theme.")
+        else:
+            theme = report.get("theme") or {"found": False}
+            if not theme.get("found"):
+                name = theme.get("name")
+                if name:
+                    st.warning(
+                        f"This report references a theme named **{name}**, but its JSON file "
+                        "couldn't be located inside the .pbix."
+                    )
+                else:
+                    st.info(
+                        "No explicit theme override found — this report uses Power BI's built-in "
+                        "default theme, which isn't stored as a file inside the .pbix."
+                    )
+            else:
+                tj = theme["json"]
+                kind = "custom theme uploaded into this report" if theme["is_custom"] else "built-in Power BI theme"
+                st.markdown(f"**{theme['name']}** — {kind}")
+
+                data_colors = tj.get("dataColors") or []
+                if data_colors:
+                    swatches = "".join(
+                        f'<span style="display:inline-block;width:22px;height:22px;'
+                        f'background:{html.escape(str(c))};border:1px solid #cbd5e1;'
+                        f'border-radius:4px;margin:2px" title="{html.escape(str(c))}"></span>'
+                        for c in data_colors
+                    )
+                    st.markdown(swatches, unsafe_allow_html=True)
+
+                info_cols = st.columns(3)
+                info_cols[0].metric("Background", tj.get("background", "—"))
+                info_cols[1].metric("Foreground (text)", tj.get("foreground", "—"))
+                info_cols[2].metric("Table/visual accent", tj.get("tableAccent", "—"))
+
+                text_classes = tj.get("textClasses") or {}
+                if text_classes:
+                    st.markdown("**Text styles**")
+                    for role in ("header", "title", "label", "callout"):
+                        tc = text_classes.get(role)
+                        if isinstance(tc, dict):
+                            st.caption(
+                                f"**{role.capitalize()}** — {tc.get('fontFace', '—')}, "
+                                f"{tc.get('fontSize', '—')}pt, {tc.get('color', '—')}"
+                            )
+
+                st.download_button(
+                    "⬇ Download theme (.json)", theme["raw_bytes"],
+                    file_name=f"{_slug(theme['name'], 'theme')}.json",
+                    mime="application/json", key="dl_theme", width="stretch",
+                )
 
 st.markdown(
     f'<div class="app-footer">🧩 VPAX Semantic Model Explorer &nbsp;·&nbsp; <b>{AUTHOR}</b></div>',
