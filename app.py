@@ -4291,6 +4291,789 @@ def build_cleaned_bim(model: Dict[str, Any], plan: Dict[str, Any]) -> bytes:
 
 
 # ==========================================================================
+# Databricks Lakeview (.lvdash.json) export
+# ==========================================================================
+# Everything here was reverse-engineered against three real exports of the
+# same "Supplier Dashboard" - one from Power BI (.pbix/.vpax) and two
+# generations of the matching Databricks Lakeview export - not against
+# published Databricks documentation, since Lakeview's dashboard JSON schema
+# isn't publicly documented the way PBIR's is. Treat the output as a strong
+# first draft, not a guaranteed-correct import: verify against a real
+# Lakeview import before trusting it in production, especially the
+# relationship direction/cardinality (see note on `_lakeview_cardinality`)
+# and the layout grid mapping (both are informed guesses, not confirmed
+# Databricks semantics).
+
+def _lakeview_id(*parts: str, length: int = 8) -> str:
+    """A short, deterministic hex id in the style of Lakeview's own ids.
+
+    Deterministic (hashed from the object's own identity, e.g. table name)
+    rather than random, so re-running the generator on an unchanged model
+    produces byte-identical output - a random id would make every export a
+    full diff even when nothing actually changed.
+    """
+    import hashlib
+    h = hashlib.md5("::".join(parts).encode("utf-8")).hexdigest()
+    return h[:length]
+
+
+def _lakeview_slug(name: Any) -> str:
+    """snake_case identifier, matching the style Lakeview's own measure/
+    dataset `name` fields use (e.g. `active_specifications`)."""
+    s = re.sub(r"[^0-9A-Za-z]+", "_", str(name or "")).strip("_").lower()
+    return s or "field"
+
+
+# --- DAX -> SQL, deliberately narrow ------------------------------------------
+# This is not a DAX parser. It recognises exactly the shapes this app's own
+# analysis has already shown are common in real models - COALESCE-wrapped
+# CALCULATE with simple equality filters around one aggregate - and refuses
+# anything else outright rather than guessing. A wrong-but-plausible-looking
+# SQL translation is worse than an honest "translate this by hand," because
+# it fails silently in a stakeholder's dashboard instead of at review time.
+
+_DAX_AGG_FUNCS: Dict[str, Tuple[str, bool]] = {
+    # DAX name -> (SQL function, needs DISTINCT)
+    "DISTINCTCOUNTNOBLANK": ("COUNT", True),
+    "DISTINCTCOUNT": ("COUNT", True),
+    "COUNTROWS": ("COUNT", False),
+    "SUM": ("SUM", False),
+    "AVERAGE": ("AVG", False),
+    "MIN": ("MIN", False),
+    "MAX": ("MAX", False),
+    "COUNT": ("COUNT", False),
+}
+
+
+def _dax_strip_comments(expr: Any) -> str:
+    s = str(expr or "")
+    s = re.sub(r"/\*.*?\*/", " ", s, flags=re.S)
+    s = re.sub(r"(--|//)[^\n]*", " ", s)
+    return s.strip()
+
+
+def _dax_matching_paren(s: str, open_idx: int) -> int:
+    depth, i, in_str = 0, open_idx, False
+    while i < len(s):
+        c = s[i]
+        if in_str:
+            if c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _dax_match_call(s: str, func_name: str) -> Optional[str]:
+    """If `s` is exactly `FUNC( ... )` (nothing before or after), its inner text."""
+    s = s.strip()
+    m = re.match(rf"^{re.escape(func_name)}\s*\(", s, re.I)
+    if not m:
+        return None
+    open_idx = m.end() - 1
+    close_idx = _dax_matching_paren(s, open_idx)
+    if close_idx == -1 or close_idx != len(s) - 1:
+        return None
+    return s[open_idx + 1:close_idx]
+
+
+def _dax_split_args(s: str) -> List[str]:
+    """Top-level comma-separated arguments, respecting parens/brackets/strings."""
+    parts, depth, buf, in_str = [], 0, [], False
+    for c in s:
+        if in_str:
+            buf.append(c)
+            if c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+            buf.append(c)
+            continue
+        if c in "([":
+            depth += 1
+        elif c in ")]":
+            depth -= 1
+        if c == "," and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(c)
+    parts.append("".join(buf))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _dax_column_ref(s: str) -> Optional[str]:
+    """Just the column name out of `'Table'[Col]` or `Table[Col]` or `[Col]`."""
+    m = re.match(r"^'?[^'\[\]]*'?\[([^\]]+)\]$", s.strip())
+    return m.group(1).strip() if m else None
+
+
+def _dax_filter_to_sql(s: str) -> Optional[str]:
+    """A single CALCULATE filter arg -> a SQL boolean, or None if not a plain
+    `<column> = "literal"` / `<column> <> "literal"` comparison (optionally
+    wrapped in KEEPFILTERS(...))."""
+    s = s.strip()
+    inner = _dax_match_call(s, "KEEPFILTERS")
+    if inner is not None:
+        s = inner.strip()
+    m = re.match(r'^(.*?)\s*(=|<>)\s*"((?:[^"]|"")*)"\s*$', s, re.S)
+    if not m:
+        return None
+    colref, op, literal = m.groups()
+    col = _dax_column_ref(colref)
+    if col is None:
+        return None
+    return f"`{col}` {op} '{literal.replace(chr(39), chr(39)*2)}'"
+
+
+def translate_dax_measure(expr: Any) -> Tuple[Optional[str], str]:
+    """Best-effort DAX -> SQL for one measure. Returns (sql_or_None, note).
+
+    Supported shape: optional `COALESCE(<agg>, <default>)` wrapping an
+    optional `CALCULATE(<aggregate>, <filter>, <filter>, ...)`, where each
+    filter is a plain equality/inequality against a string literal, and the
+    aggregate is one of the functions in `_DAX_AGG_FUNCS` applied to a single
+    column (or, for COUNTROWS, a bare table with no nested filtering - a
+    filtered CALCULATETABLE/FILTER argument is refused rather than silently
+    dropped, since dropping it would understate the count).
+    """
+    s = _dax_strip_comments(expr)
+    if not s:
+        return None, "Empty or fully commented-out expression."
+
+    default_sql = None
+    coalesce_inner = _dax_match_call(s, "COALESCE")
+    if coalesce_inner is not None:
+        args = _dax_split_args(coalesce_inner)
+        if len(args) == 2:
+            s, default_sql = args[0], args[1]
+        elif args:
+            s = args[0]
+
+    filters_sql: List[str] = []
+    agg_expr = s
+    calc_inner = _dax_match_call(s, "CALCULATE")
+    if calc_inner is not None:
+        args = _dax_split_args(calc_inner)
+        if not args:
+            return None, "CALCULATE() with no arguments."
+        agg_expr = args[0]
+        for f in args[1:]:
+            fsql = _dax_filter_to_sql(f)
+            if fsql is None:
+                return None, f"CALCULATE filter isn't a plain equality: `{f[:70]}`"
+            filters_sql.append(fsql)
+
+    match = None
+    for dax_name, (sql_func, needs_distinct) in _DAX_AGG_FUNCS.items():
+        arg = _dax_match_call(agg_expr, dax_name)
+        if arg is not None:
+            match = (dax_name, sql_func, needs_distinct, arg)
+            break
+    if match is None:
+        return None, f"Unsupported aggregate or expression shape: `{agg_expr[:70]}`"
+    dax_name, sql_func, needs_distinct, arg = match
+    where = " AND ".join(filters_sql) if filters_sql else None
+
+    if dax_name == "COUNTROWS":
+        if not re.match(r"^'?[^'()]+'?$", arg.strip()):
+            return None, "COUNTROWS wraps a filtered table expression, not a bare table."
+        sql = f"COUNT(CASE WHEN {where} THEN 1 END)" if where else "COUNT(*)"
+    else:
+        col = _dax_column_ref(arg)
+        if col is None:
+            return None, f"Aggregate argument isn't a plain column reference: `{arg[:70]}`"
+        distinct = "DISTINCT " if needs_distinct else ""
+        sql = (f"{sql_func}({distinct}CASE WHEN {where} THEN `{col}` END)" if where
+               else f"{sql_func}({distinct}`{col}`)")
+
+    if default_sql is not None:
+        sql = f"COALESCE({sql}, {default_sql})"
+    return sql, "Translated."
+
+
+# --- Table -> dataset -----------------------------------------------------
+
+def _lakeview_measure_home_table(
+    table: str, expr: str, measure_group_tables: Set[str], all_table_names: List[str]
+) -> str:
+    """Where a measure's SQL should live.
+
+    A PBIX "measure group" table (a hidden table that exists only to hold
+    per-page measures, has no columns of its own, and therefore has no real
+    counterpart in the warehouse) can't host a Lakeview measure - Lakeview
+    measures belong to a dataset backed by a real table. Retarget to the
+    first real table the measure's own DAX references; if it references
+    none (a constant, or something this app can't resolve), the caller drops
+    it and the conversion report explains why.
+    """
+    if table not in measure_group_tables:
+        return table
+    for candidate in all_table_names:
+        if candidate == table or candidate in measure_group_tables:
+            continue
+        if find_referenced_tables(expr, [candidate]):
+            return candidate
+    return ""
+
+
+def build_lakeview_datasets(
+    model: Dict[str, Any], catalog: str, schema: str, table_name_map: Dict[str, str]
+) -> Tuple[List[Dict[str, Any]], Dict[str, str], Dict[Tuple[str, str], str], pd.DataFrame]:
+    """One flat, single-table dataset per model table (plus the model's own
+    relationships, built separately) - not a pre-joined tree.
+
+    That choice is deliberate, not a simplification for its own sake: the
+    live experiment run against this exact model showed that once a
+    `relationshipGraphs` block exists, Lakeview resolves joins across
+    datasets at query time, and a dataset's own nested `joins[]` tree is only
+    needed to *expose a joined table's columns as if they belonged to it* -
+    which this generator never needs, because every widget binding is
+    resolved back to the real table that owns the field.
+
+    Returns (datasets, {table_name: dataset_id}, {(table, measure_name): sql_name},
+    conversion_report).
+    """
+    report_rows: List[Dict[str, Any]] = []
+    datasets: List[Dict[str, Any]] = []
+    table_to_dataset: Dict[str, str] = {}
+    measure_sql_names: Dict[Tuple[str, str], str] = {}
+
+    bim_tables = model.get("bim_tables") or []
+    measure_group_tables = {t["name"] for t in bim_tables if _is_measure_group(t) and t.get("name")}
+    all_tables = model["all_table_names"]
+    cols_df = _user_facing_columns(model["columns"])
+    meas_df = model["measures"]
+
+    for table in all_tables:
+        if table in measure_group_tables:
+            continue  # no real backing table - its measures are retargeted below
+        ds_id = _lakeview_id("dataset", table)
+        table_to_dataset[table] = ds_id
+        db_name = table_name_map.get(table, _lakeview_slug(table))
+
+        dimensions = []
+        if {"TableName", "ColumnName"}.issubset(cols_df.columns):
+            for _, c in cols_df.loc[cols_df["TableName"] == table].dropna(subset=["ColumnName"]).iterrows():
+                col = str(c["ColumnName"])
+                dimensions.append({
+                    "name": col, "expr": f"source.{col}",
+                    "displayName": col,
+                    "comment": str(c.get("Description") or ""),
+                })
+
+        measures = [{"name": "count", "expr": "COUNT(*)",
+                     "comment": "Total row count.", "displayName": "Count"}]
+        if {"TableName", "MeasureName", "MeasureExpression"}.issubset(meas_df.columns):
+            for _, m in meas_df.dropna(subset=["MeasureName"]).iterrows():
+                home = _lakeview_measure_home_table(
+                    str(m["TableName"]), str(m.get("MeasureExpression") or ""),
+                    measure_group_tables, all_tables,
+                )
+                if home != table:
+                    continue
+                sql, note = translate_dax_measure(m.get("MeasureExpression"))
+                sql_name = _lakeview_slug(m["MeasureName"])
+                report_rows.append({
+                    "Object Type": "Measure", "Table": table, "Name": str(m["MeasureName"]),
+                    "Status": "Translated" if sql else "Not translated",
+                    "Severity": "Info" if sql else "Medium", "Detail": note,
+                })
+                if sql:
+                    measures.append({
+                        "name": sql_name, "expr": sql,
+                        "comment": (str(m.get("Description") or "").strip()
+                                   or f"Translated from DAX measure `{m['MeasureName']}` — verify against the source report."),
+                        "displayName": str(m["MeasureName"]),
+                    })
+                    measure_sql_names[(str(m["TableName"]), str(m["MeasureName"]))] = sql_name
+
+        datasets.append({
+            "name": ds_id, "displayName": table,
+            "config": {
+                "version": "1.1",
+                "source": f"{catalog}.{schema}.{db_name}",
+                "dimensions": dimensions,
+                "measures": measures,
+            },
+        })
+
+    # Measures whose home table couldn't be resolved at all (no real table
+    # referenced anywhere in their DAX) - report, don't silently drop.
+    if {"TableName", "MeasureName", "MeasureExpression"}.issubset(meas_df.columns):
+        for _, m in meas_df.dropna(subset=["MeasureName"]).iterrows():
+            table = str(m["TableName"])
+            if table not in measure_group_tables:
+                continue
+            home = _lakeview_measure_home_table(
+                table, str(m.get("MeasureExpression") or ""), measure_group_tables, all_tables,
+            )
+            if not home:
+                report_rows.append({
+                    "Object Type": "Measure", "Table": table, "Name": str(m["MeasureName"]),
+                    "Status": "Not translated", "Severity": "Medium",
+                    "Detail": "This measure lives on a report-only measure-group table and its "
+                              "DAX doesn't clearly reference a real model table — assign it to a "
+                              "dataset by hand.",
+                })
+
+    report_df = sort_by_severity(_ensure_columns(
+        pd.DataFrame(report_rows), ["Object Type", "Table", "Name", "Status", "Severity", "Detail"]
+    ))
+    return datasets, table_to_dataset, measure_sql_names, report_df
+
+
+def _lakeview_cardinality(from_card: str, to_card: str) -> str:
+    """PBIX one/many per side -> Lakeview's CARDINALITY_* enum.
+
+    Caveat, stated plainly: the one real example available (the second
+    Lakeview export inspected in this session) records `from`/`to` in the
+    direction the join tree happened to be authored in, which did not match
+    the intuitive "fact is many, dimension is one" reading of the equivalent
+    PBIX relationship. Whether Databricks treats `from`/`to` as directional
+    in a way that affects query results, or purely as a label, is unconfirmed
+    - verify the generated direction against a real Lakeview import rather
+    than trusting this mapping blindly.
+    """
+    f, t = from_card.lower(), to_card.lower()
+    if f.startswith("many") and t.startswith("one"):
+        return "CARDINALITY_MANY_TO_ONE"
+    if f.startswith("one") and t.startswith("many"):
+        return "CARDINALITY_ONE_TO_MANY"
+    return "CARDINALITY_ONE_TO_ONE"
+
+
+def build_lakeview_relationship_graph(
+    model: Dict[str, Any], table_to_dataset: Dict[str, str]
+) -> Tuple[List[Dict[str, Any]], pd.DataFrame]:
+    rels = model["relationships"]
+    report_rows: List[Dict[str, Any]] = []
+    if rels.empty or not table_to_dataset:
+        return [], _ensure_columns(pd.DataFrame(), ["Object Type", "Table", "Name", "Status", "Severity", "Detail"])
+
+    included_tables = sorted(table_to_dataset)
+    sources = [{"name": t, "datasetName": table_to_dataset[t]} for t in included_tables]
+    relationships = []
+    for _, r in rels.iterrows():
+        ft, tt = str(r.get("From Table") or ""), str(r.get("To Table") or "")
+        fc, tc = str(r.get("From Column") or ""), str(r.get("To Column") or "")
+        if not ft or not tt or ft == tt:
+            continue
+        if ft not in table_to_dataset or tt not in table_to_dataset:
+            report_rows.append({
+                "Object Type": "Relationship", "Table": f"{ft} → {tt}", "Name": f"{fc} = {tc}",
+                "Status": "Not migrated", "Severity": "Medium",
+                "Detail": "One endpoint's table has no generated dataset (its home table is a "
+                          "measure-group table, or it wasn't in the model's table list).",
+            })
+            continue
+        relationships.append({
+            "name": _lakeview_id("rel", ft, fc, tt, tc, length=20),
+            "from": ft, "to": tt,
+            "on": f"`{ft}`.`{fc}` = `{tt}`.`{tc}`",
+            "cardinality": _lakeview_cardinality(
+                str(r.get("From Cardinality") or "Many"), str(r.get("To Cardinality") or "One")
+            ),
+        })
+        if str(r.get("Cross Filter Direction")) == "Both":
+            report_rows.append({
+                "Object Type": "Relationship", "Table": f"{ft} ↔ {tt}", "Name": f"{fc} = {tc}",
+                "Status": "Migrated — verify direction", "Severity": "Low",
+                "Detail": "Bi-directional in the PBIX model. Lakeview's relationship graph has "
+                          "no cross-filter-direction equivalent — any widget that depended on "
+                          "the filter travelling from the 'many' side back up to the 'one' side "
+                          "needs manual verification.",
+            })
+
+    graph = [{"sources": sources, "relationships": relationships}] if relationships else []
+    return graph, sort_by_severity(_ensure_columns(
+        pd.DataFrame(report_rows), ["Object Type", "Table", "Name", "Status", "Severity", "Detail"]
+    ))
+
+
+# --- Report layer: PBIR pages/visuals -> Lakeview pages/widgets -----------
+
+_LAKEVIEW_WIDGET_MAP: Dict[str, str] = {
+    "card": "counter", "multiRowCard": "counter",
+    "barChart": "bar", "clusteredColumnChart": "bar", "columnChart": "bar",
+    "clusteredBarChart": "bar", "lineChart": "line", "lineClusteredColumnComboChart": "line",
+    "pieChart": "pie", "donutChart": "pie",
+    "tableEx": "table", "pivotTable": "table",
+    "slicer": "filter-multi-select",
+}
+_LAKEVIEW_UNSUPPORTED_NOTE = (
+    "No Lakeview widget type corresponds to this visual — it will need to be "
+    "rebuilt by hand, or dropped, in the Databricks dashboard."
+)
+
+
+def _pbir_page_dirs(z: zipfile.ZipFile) -> Dict[str, str]:
+    """{pbix page displayName: internal page-folder id} for PBIR-format reports."""
+    norm = {n.replace("\\", "/"): n for n in z.namelist()}
+    index_key = next((k for k in norm if k.endswith("Report/definition/pages/pages.json")), None)
+    if index_key is None:
+        return {}
+    prefix = index_key.rsplit("/", 1)[0] + "/"
+    out = {}
+    for key, orig in norm.items():
+        if key.startswith(prefix) and key.endswith("/page.json"):
+            page_id = key[len(prefix):].split("/", 1)[0]
+            try:
+                page = _read_json_member(z, orig)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            out[str(page.get("displayName") or page.get("name") or page_id)] = page_id
+    return out
+
+
+def _pbir_page_visuals(z: zipfile.ZipFile, page_id: str) -> Tuple[int, int, List[Dict[str, Any]]]:
+    """(page width, page height, [visual dict, ...]) for one PBIR page."""
+    norm = {n.replace("\\", "/"): n for n in z.namelist()}
+    page_key = next(
+        (orig for key, orig in norm.items()
+         if key.endswith(f"Report/definition/pages/{page_id}/page.json")), None
+    )
+    if page_key is None:
+        return 1280, 720, []
+    page = _read_json_member(z, page_key)
+    width, height = int(page.get("width") or 1280), int(page.get("height") or 720)
+
+    prefix = None
+    for key in norm:
+        if key.endswith(f"Report/definition/pages/{page_id}/page.json"):
+            prefix = key.rsplit("/", 1)[0] + "/visuals/"
+            break
+    visuals = []
+    if prefix:
+        for key, orig in norm.items():
+            if key.startswith(prefix) and key.endswith("/visual.json"):
+                try:
+                    visuals.append(_read_json_member(z, orig))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+    return width, height, visuals
+
+
+def _visual_title(visual_def: Dict[str, Any], fallback: str) -> str:
+    """A human-readable title for a visual that (usually) never explicitly set one.
+
+    PBIX visuals are frequently untitled - Power BI falls back to auto-
+    generated text at render time, which isn't stored in the file. This
+    checks for an explicit title override first, then borrows the first
+    field's own display name as a reasonable stand-in, and only falls back
+    to the visual's internal id if neither exists.
+    """
+    visual = visual_def.get("visual") or {}
+    try:
+        lit = visual["visualContainerObjects"]["title"][0]["properties"]["text"]["expr"]["Literal"]["Value"]
+        if isinstance(lit, str) and lit.strip("'\""):
+            return lit.strip("'\"")
+    except (KeyError, IndexError, TypeError):
+        pass
+
+    def find_display(node: Any) -> Optional[str]:
+        if isinstance(node, dict):
+            for key in ("displayName", "nativeQueryRef"):
+                v = node.get(key)
+                if isinstance(v, str) and v.strip():
+                    return v
+            for val in node.values():
+                found = find_display(val)
+                if found:
+                    return found
+        elif isinstance(node, list):
+            for item in node:
+                found = find_display(item)
+                if found:
+                    return found
+        return None
+
+    return find_display(visual.get("query") or {}) or fallback
+
+
+def _visual_text(visual_def: Dict[str, Any]) -> Optional[str]:
+    """The literal text out of a textbox visual, or None if this isn't one."""
+    v = visual_def.get("visual") or {}
+    if str(v.get("visualType")) != "textbox":
+        return None
+    paragraphs = ((v.get("objects") or {}).get("general") or [{}])[0].get("properties", {}).get("paragraphs", [])
+    lines = []
+    for p in paragraphs:
+        lines.append("".join(str(r.get("value") or "") for r in p.get("textRuns") or []))
+    return "\n".join(lines)
+
+
+def _grid_position(x: float, y: float, w: float, h: float, page_w: int, row_px: float) -> Dict[str, int]:
+    """Absolute PBIX pixels -> Lakeview's 12-column relative grid.
+
+    A linear bin, not pixel-perfect: PBIX layouts are freeform (arbitrary
+    overlap, z-order) and Lakeview's grid is stacked and non-overlapping, so
+    some manual nudging after import should be expected regardless of how
+    this function is tuned.
+    """
+    col_w = max(page_w, 1) / 12
+    gx = max(0, min(11, round(x / col_w)))
+    gw = max(1, min(12 - gx, round(w / col_w)))
+    gy = max(0, round(y / row_px))
+    gh = max(1, round(h / row_px))
+    return {"x": gx, "y": gy, "width": gw, "height": gh}
+
+
+def build_lakeview_pages(
+    model: Dict[str, Any], pbix_bytes: bytes, chosen_pages: List[str],
+    table_to_dataset: Dict[str, str], measure_sql_names: Dict[Tuple[str, str], str],
+    row_px: float = 40.0,
+) -> Tuple[List[Dict[str, Any]], pd.DataFrame]:
+    report_rows: List[Dict[str, Any]] = []
+    pages_out: List[Dict[str, Any]] = []
+
+    with zipfile.ZipFile(io.BytesIO(pbix_bytes)) as z:
+        page_dirs = _pbir_page_dirs(z)
+        if not page_dirs:
+            report_rows.append({
+                "Object Type": "Page", "Table": "", "Name": "(whole report)",
+                "Status": "Not migrated", "Severity": "Medium",
+                "Detail": "This .pbix uses the classic 'Report/Layout' format. Page/widget "
+                          "generation currently only supports the newer PBIR format (Save As, "
+                          "or File ➜ Options ➜ Preview features ➜ 'Power BI Project' in Desktop). "
+                          "Datasets and relationships above are unaffected.",
+            })
+            return [], _ensure_columns(pd.DataFrame(report_rows),
+                                       ["Object Type", "Table", "Name", "Status", "Severity", "Detail"])
+
+        for page_name in chosen_pages:
+            page_id = page_dirs.get(page_name)
+            if page_id is None:
+                continue
+            page_w, page_h, visuals = _pbir_page_visuals(z, page_id)
+            layout = []
+            for v in visuals:
+                name = str(v.get("name") or "")
+                pos = v.get("position") or {}
+                x, y = float(pos.get("x", 0)), float(pos.get("y", 0))
+                w, h = float(pos.get("width", 100)), float(pos.get("height", 100))
+                grid = _grid_position(x, y, w, h, page_w, row_px)
+
+                visual = v.get("visual") or {}
+                v_type = visual.get("visualType")
+
+                text = _visual_text(v)
+                if text is not None:
+                    layout.append({
+                        "widget": {"name": _lakeview_slug(text.splitlines()[0] if text else name) or name,
+                                  "multilineTextboxSpec": {"lines": [line + "\n" for line in text.splitlines()] or [""]}},
+                        "position": grid,
+                    })
+                    continue
+
+                if "visualGroup" in v:
+                    continue  # a layout container only, not a widget - nothing to migrate
+
+                widget_type = _LAKEVIEW_WIDGET_MAP.get(str(v_type))
+                if widget_type is None:
+                    report_rows.append({
+                        "Object Type": "Visual", "Table": page_name, "Name": f"{name} ({v_type})",
+                        "Status": "Not migrated", "Severity": "Medium",
+                        "Detail": _LAKEVIEW_UNSUPPORTED_NOTE,
+                    })
+                    continue
+
+                bindings = []
+                seen: Set[Tuple[str, str, str]] = set()
+                for table, field, kind in _collect_field_refs(v):
+                    if not field or table not in table_to_dataset:
+                        continue
+                    key = (table, field, kind)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if kind == "Measure":
+                        sql_name = measure_sql_names.get((table, field))
+                        if sql_name is None:
+                            continue  # untranslated measure - already reported by the dataset builder
+                        bindings.append((table, field, "Measure", sql_name))
+                    else:
+                        bindings.append((table, field, "Column", field))
+
+                title = _visual_title(v, name)
+
+                if not bindings:
+                    report_rows.append({
+                        "Object Type": "Visual", "Table": page_name, "Name": f"{name} ({v_type})",
+                        "Status": "Not migrated", "Severity": "Medium",
+                        "Detail": "None of this visual's fields could be resolved to a generated "
+                                  "dataset (every one was either an untranslated measure or on a "
+                                  "table outside this generator's scope).",
+                    })
+                    continue
+
+                by_table: Dict[str, List[Tuple[str, str, str, str]]] = {}
+                for b in bindings:
+                    by_table.setdefault(b[0], []).append(b)
+                queries = []
+                field_query: Dict[str, str] = {}
+                for i, (table, items) in enumerate(by_table.items()):
+                    qname = "main_query" if len(by_table) == 1 else f"{_lakeview_slug(table)}_query"
+                    fields = []
+                    for _, disp_name, kind, sql_name in items:
+                        expr = f"MEASURE(`{sql_name}`)" if kind == "Measure" else f"`{sql_name}`"
+                        field_name = f"measure({sql_name})" if kind == "Measure" else sql_name
+                        fields.append({"name": field_name, "expression": expr})
+                        field_query[field_name] = qname
+                    queries.append({"name": qname, "query": {
+                        "datasetName": table_to_dataset[table], "fields": fields, "disaggregated": False,
+                    }})
+
+                all_field_names = list(field_query)
+                measure_fields = [f for f in all_field_names if f.startswith("measure(")]
+                column_fields = [f for f in all_field_names if not f.startswith("measure(")]
+
+                if widget_type == "counter":
+                    value_field = (measure_fields or column_fields or [None])[0]
+                    if value_field is None:
+                        continue
+                    spec = {"version": 2, "frame": {"showTitle": True, "title": title},
+                           "widgetType": "counter",
+                           "encodings": {"value": {"fieldName": value_field}},
+                           "data": {"queryName": field_query[value_field]}}
+                elif widget_type in ("bar", "line", "pie"):
+                    x_field = (measure_fields or all_field_names or [None])[0]
+                    y_field = (column_fields or [f for f in all_field_names if f != x_field] or [None])[0]
+                    if x_field is None or y_field is None:
+                        continue
+                    spec = {"version": 3, "frame": {"showTitle": True, "title": title},
+                           "widgetType": widget_type,
+                           "encodings": {
+                               "x": {"fieldName": x_field, "scale": {"type": "quantitative"}},
+                               "y": {"fieldName": y_field, "scale": {"type": "categorical"}},
+                           },
+                           "data": {"queryName": field_query[x_field]}}
+                    if len(all_field_names) > 2:
+                        report_rows.append({
+                            "Object Type": "Visual", "Table": page_name, "Name": name,
+                            "Status": "Migrated — verify encodings", "Severity": "Low",
+                            "Detail": f"{len(all_field_names)} fields bound on this visual; only "
+                                      "the first measure/column pair was mapped to x/y — check the "
+                                      "remaining fields.",
+                        })
+                elif widget_type == "table":
+                    spec = {"version": 2, "frame": {"showTitle": True, "title": title},
+                           "widgetType": "table",
+                           "encodings": {"columns": [
+                               {"fieldName": f, "useForSearch": False, "displayName": f}
+                               for f in all_field_names
+                           ]},
+                           "data": {"queryName": queries[0]["name"] if len(queries) == 1 else queries[0]["name"]}}
+                    if len(queries) > 1:
+                        report_rows.append({
+                            "Object Type": "Visual", "Table": page_name, "Name": name,
+                            "Status": "Migrated — verify columns", "Severity": "Low",
+                            "Detail": "This table binds fields from more than one dataset — only "
+                                      "the first dataset's query is wired as the table's data "
+                                      "source; the rest need manual reconciliation.",
+                        })
+                else:  # filter-multi-select
+                    field_name = all_field_names[0]
+                    qname = field_query[field_name]
+                    queries[0]["query"]["fields"].append({
+                        "name": f"{field_name}_associativity",
+                        "expression": "COUNT_IF(`associative_filter_predicate_group`)",
+                    })
+                    spec = {"version": 2, "frame": {"showTitle": True, "title": title},
+                           "widgetType": widget_type,
+                           "encodings": {"fields": [{"fieldName": field_name, "queryName": qname}]}}
+
+                layout.append({
+                    "widget": {"name": _lakeview_id("widget", page_name, name, length=20),
+                              "queries": queries, "spec": spec},
+                    "position": grid,
+                })
+
+            if layout:
+                pages_out.append({
+                    "name": _lakeview_id("page", page_name), "displayName": page_name,
+                    "pageType": "PAGE_TYPE_CANVAS", "layoutVersion": "GRID_V1", "layout": layout,
+                })
+
+    return pages_out, sort_by_severity(_ensure_columns(
+        pd.DataFrame(report_rows), ["Object Type", "Table", "Name", "Status", "Severity", "Detail"]
+    ))
+
+
+def build_lakeview_theme(report: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    default = {
+        "canvasBackgroundColor": {"light": "#F5F5F5", "dark": "#1F272D"},
+        "widgetBackgroundColor": {"light": "#FFFFFF", "dark": "#2C3640"},
+        "fontColor": {"light": "#424242", "dark": "#E0E0E0"},
+        "selectionColor": {"light": "#2196F3", "dark": "#2196F3"},
+        "visualizationColors": ["#2196F3", "#4CAF50", "#FF9800", "#F44336", "#9C27B0",
+                                "#00BCD4", "#FFEB3B", "#795548", "#607D8B", "#E91E63"],
+        "fontFamily": "Inter", "widgetPadding": 12, "widgetCornerRadius": 8, "widgetShadow": 8,
+    }
+    if not report:
+        return default
+    theme = (report.get("theme") or {})
+    if not theme.get("found"):
+        return default
+    tj = theme.get("json") or {}
+    data_colors = tj.get("dataColors") or []
+    out = dict(default)
+    if tj.get("background"):
+        out["canvasBackgroundColor"] = {"light": tj["background"], "dark": default["canvasBackgroundColor"]["dark"]}
+    if tj.get("foreground"):
+        out["fontColor"] = {"light": tj["foreground"], "dark": default["fontColor"]["dark"]}
+    if data_colors:
+        out["visualizationColors"] = (data_colors + default["visualizationColors"])[:10]
+    return out
+
+
+def build_lakeview_dashboard(
+    model: Dict[str, Any], catalog: str, schema: str, table_name_map: Dict[str, str],
+    pbix_bytes: Optional[bytes], chosen_pages: List[str], report: Optional[Dict[str, Any]],
+    include_relationships: bool = True,
+) -> Tuple[Dict[str, Any], pd.DataFrame]:
+    datasets, table_to_dataset, measure_sql_names, ds_report = build_lakeview_datasets(
+        model, catalog, schema, table_name_map
+    )
+    reports = [ds_report]
+
+    dashboard: Dict[str, Any] = {"datasets": datasets}
+
+    if include_relationships:
+        graph, rel_report = build_lakeview_relationship_graph(model, table_to_dataset)
+        if graph:
+            dashboard["relationshipGraphs"] = graph
+        reports.append(rel_report)
+
+    pages: List[Dict[str, Any]] = []
+    if pbix_bytes and chosen_pages:
+        pages, page_report = build_lakeview_pages(
+            model, pbix_bytes, chosen_pages, table_to_dataset, measure_sql_names
+        )
+        reports.append(page_report)
+    dashboard["pages"] = pages or [{
+        "name": _lakeview_id("page", "overview"), "displayName": "Overview",
+        "pageType": "PAGE_TYPE_CANVAS", "layoutVersion": "GRID_V1", "layout": [],
+    }]
+
+    dashboard["uiSettings"] = {"theme": build_lakeview_theme(report), "applyModeEnabled": False}
+
+    report_df = pd.concat(reports, ignore_index=True) if reports else pd.DataFrame()
+    report_df = sort_by_severity(_ensure_columns(
+        report_df, ["Object Type", "Table", "Name", "Status", "Severity", "Detail"]
+    ))
+    return dashboard, report_df
+
+
+# ==========================================================================
 # Rendering helpers
 # ==========================================================================
 
@@ -4735,6 +5518,7 @@ NAV_GROUPS: Dict[str, List[str]] = {
         "Security & Perspectives", "RLS Simulator", "Fix Script (C#)", "Model Cleanup",
         "Data Dictionary Export", "Theme",
     ],
+    "🧱 Migrate": ["Databricks Lakeview Export"],
 }
 
 # Which finding set backs each page, so the scorecard and the sidebar badges
@@ -5404,6 +6188,15 @@ if nav_page == "Power Query (SQL)":
                 matches = with_sql.loc[with_sql["TableName"] == choice, "SQL"]
                 sql = str(matches.iloc[0]) if not matches.empty else ""
                 st.code(sql or "-- no SQL found for this table", language="sql")
+                if sql:
+                    sources = _sql_sources(sql)
+                    if sources:
+                        names = sorted({".".join(x for x in s if x) for s in sources})
+                        st.caption(
+                            "**Reads from:** " + ", ".join(f"`{n}`" for n in names)
+                            + " — see **Investigate ➜ Source Lineage** for dialect selection, "
+                              "blast-radius analysis, and a diagram."
+                        )
                 st.download_button(
                     "⬇ Download SQL", sql.encode("utf-8"),
                     file_name=f"{_slug(choice, 'query')}.sql",
@@ -6366,6 +7159,148 @@ if nav_page == "Model Cleanup":
                     "to a single .pbix. Run against a copy and keep a backup.",
                     icon="⚠️",
                 )
+
+# --- Databricks Lakeview Export ------------------------------------------------
+if nav_page == "Databricks Lakeview Export":
+    with tab_guard("Databricks Lakeview Export"):
+        st.subheader("Generate a Databricks Lakeview dashboard (.lvdash.json)")
+        st.caption(
+            "Reverse-engineered against three real exports of the same dashboard from both "
+            "platforms — not against published Databricks documentation, since Lakeview's "
+            "schema isn't publicly documented the way Power BI's PBIR format is. Treat the "
+            "output as a strong first draft: a table per model table, a relationship graph "
+            "from the model's relationships, and (with a .pbix) widgets rebuilt from each "
+            "page's visuals. Verify the result against a real Lakeview import — especially "
+            "relationship direction and the layout grid, both flagged below as informed "
+            "guesses, not confirmed Databricks behaviour."
+        )
+
+        lineage_guess = build_sql_lineage(model)
+        default_catalog, default_schema = "workspace", "default"
+        if not lineage_guess.empty:
+            db_mode = lineage_guess["Database"].mode()
+            sch_mode = lineage_guess["Schema"].mode()
+            if len(db_mode) and db_mode.iloc[0]:
+                default_catalog = db_mode.iloc[0]
+            if len(sch_mode) and sch_mode.iloc[0]:
+                default_schema = sch_mode.iloc[0]
+
+        c1, c2 = st.columns(2)
+        catalog = c1.text_input(
+            "Unity Catalog catalog", value=default_catalog, key="lv_catalog",
+            help="Guessed from the Source Lineage scan where possible.",
+        )
+        schema = c2.text_input("Schema", value=default_schema, key="lv_schema")
+
+        with st.expander("Table name mapping", expanded=False):
+            st.caption(
+                "Every model table becomes one Lakeview dataset, sourced from "
+                "`catalog.schema.<name below>`. Edit any row where the Databricks table "
+                "name won't exactly match the Power BI table name."
+            )
+            name_map_df = pd.DataFrame({
+                "Power BI Table": model["all_table_names"],
+                "Databricks Table Name": [_lakeview_slug(t) for t in model["all_table_names"]],
+            })
+            edited = st.data_editor(
+                name_map_df, hide_index=True, width="stretch", key="lv_name_map",
+                disabled=["Power BI Table"],
+            )
+            table_name_map = dict(zip(edited["Power BI Table"], edited["Databricks Table Name"]))
+
+        include_rel = st.checkbox(
+            "Include a relationshipGraphs block", value=True, key="lv_include_rel",
+            help="Built from this model's relationships. Leave off if you'd rather define "
+                 "joins by hand in Databricks.",
+        )
+
+        chosen_pages: List[str] = []
+        pbix_bytes_for_export = pbix_file.getvalue() if pbix_file is not None else None
+        if pbix_bytes_for_export is None:
+            st.info(
+                "👈 Upload the matching **.pbix** in the sidebar to also generate pages and "
+                "widgets. Without it, this produces datasets and relationships only.",
+                icon="🖥️",
+            )
+        else:
+            all_pbix_pages = model["screens"]["Screen / Page Name"].tolist() if not model["screens"].empty else []
+            report_pages = report["pages"]["Screen / Page Name"].tolist() if report and not report["pages"].empty else []
+            page_options = report_pages or all_pbix_pages
+            if not page_options:
+                st.warning("Couldn't read any page names from this .pbix.", icon="⚠️")
+            else:
+                st.caption(
+                    "Pick the pages worth migrating. Most real reports carry tooltip, "
+                    "definition, and helper pages alongside the ones people actually look at — "
+                    "there's no reliable way to tell those apart automatically, so nothing is "
+                    "pre-selected."
+                )
+                chosen_pages = st.multiselect(
+                    "Pages to include", page_options, key="lv_pages",
+                    help="Layout generation currently supports the newer PBIR-format .pbix "
+                         "only (Power BI Desktop's 'Power BI project' file format).",
+                )
+
+        if st.button("⚙️ Generate Lakeview JSON", key="lv_generate", width="stretch"):
+            with st.spinner("Translating measures, relationships, and pages…"):
+                dashboard, conv_report = build_lakeview_dashboard(
+                    model, catalog.strip() or "workspace", schema.strip() or "default",
+                    table_name_map, pbix_bytes_for_export, chosen_pages, report,
+                    include_relationships=include_rel,
+                )
+            st.session_state["lv_dashboard"] = dashboard
+            st.session_state["lv_report"] = conv_report
+
+        dashboard = st.session_state.get("lv_dashboard")
+        conv_report = st.session_state.get("lv_report")
+        if dashboard is not None:
+            n_datasets = len(dashboard.get("datasets", []))
+            n_measures = sum(len(d["config"].get("measures", [])) for d in dashboard.get("datasets", []))
+            n_rels = sum(len(g.get("relationships", [])) for g in dashboard.get("relationshipGraphs", []))
+            n_widgets = sum(len(p.get("layout", [])) for p in dashboard.get("pages", []))
+
+            k = st.columns(4)
+            k[0].metric("Datasets", n_datasets)
+            k[1].metric("Measures included", n_measures)
+            k[2].metric("Relationships", n_rels)
+            k[3].metric("Widgets generated", n_widgets)
+
+            if conv_report is not None and not conv_report.empty:
+                counts = severity_counts(conv_report)
+                translated = int((conv_report["Status"] == "Translated").sum())
+                not_translated = int((conv_report["Status"] == "Not translated").sum())
+                if not_translated:
+                    st.warning(
+                        f"{not_translated} item(s) need manual work in Databricks — see the "
+                        "conversion report below. Everything else generated cleanly.",
+                        icon="🟠",
+                    )
+                else:
+                    st.success("Every measure, relationship, and visual translated cleanly.", icon="✅")
+                st.markdown("#### Conversion report")
+                st.caption(
+                    "One row per object this generator had an opinion about. `Info`/`Translated` "
+                    "rows are informational; everything else needs a look before you trust the "
+                    "output."
+                )
+                show_table(conv_report, "Lakeview Conversion Report", height=360, key="lv_report_table")
+
+            payload = json.dumps(dashboard, indent=2).encode("utf-8")
+            with st.expander("Preview generated JSON", expanded=False):
+                st.code(json.dumps(dashboard, indent=2)[:20000], language="json")
+                if len(payload) > 20000:
+                    st.caption(f"Preview truncated — full file is {len(payload) / 1024:.0f} KB.")
+            st.download_button(
+                "⬇ Download .lvdash.json", payload,
+                file_name=f"{_slug(model.get('model_name') or 'dashboard')}.lvdash.json",
+                mime="application/json", key="dl_lvdash", width="stretch",
+            )
+            st.info(
+                "Import via Databricks: Dashboards ➜ Create ➜ Import from file, or the "
+                "Lakeview REST API. Confirm the catalog/schema/table names above match what's "
+                "actually registered in Unity Catalog before importing.",
+                icon="ℹ️",
+            )
 
 st.markdown(
     f'<div class="app-footer">🧩 VPAX Semantic Model Explorer &nbsp;·&nbsp; <b>{AUTHOR}</b></div>',
