@@ -136,7 +136,7 @@ if not st.runtime.exists():
 
 st.set_page_config(
     page_title="VPAX Semantic Model Explorer",
-    page_icon="🧩",
+    page_icon=":material/account_tree:",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -221,58 +221,11 @@ def inject_css() -> None:
           }
           .app-footer b { color: #2d6ca8; }
 
-          /* Navigation.
-             Both selectors are radios rather than st.tabs, because st.tabs
-             renders every tab body on every rerun and can't be switched
-             programmatically - and the scorecard's "Open ->" buttons need to
-             jump the user to a specific page. Streamlit stamps a
-             .st-key-<widget key> class on each widget's container, which is
-             the stable hook these rules attach to; the aria-label selectors
-             are a belt-and-braces fallback. */
-
-          /* Group selector (sidebar): a stacked nav list. */
-          .st-key-nav_group label,
-          div[data-testid="stRadioGroup"][aria-label="nav_group"] label {
-            background: #ffffff; border: 1px solid #dbe3ec; border-radius: 8px;
-            padding: .45rem .7rem; margin-bottom: .35rem; width: 100%;
-            transition: background .12s ease, border-color .12s ease;
-          }
-          .st-key-nav_group label:hover { border-color: #93b4d4; }
-          .st-key-nav_group label:has(input:checked),
-          div[data-testid="stRadioGroup"][aria-label="nav_group"] label:has(input:checked) {
-            background: #eaf2fb; border-color: #2d6ca8;
-          }
-          .st-key-nav_group label:has(input:checked) p { font-weight: 700; color: #1f3a5f; }
-          .st-key-nav_group div[role="radiogroup"] > label > div:first-child { display: none; }
-
-          /* Page selector (main area): a segmented control that reads like the
-             tab strip it replaced. */
-          .st-key-nav_page div[role="radiogroup"],
-          div[data-testid="stRadioGroup"][aria-label="nav_page"] {
-            display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid #e3e8ef;
-            padding-bottom: .6rem; margin-bottom: 1rem;
-          }
-          .st-key-nav_page label,
-          div[data-testid="stRadioGroup"][aria-label="nav_page"] label {
-            background: #fbfcfd; border: 1px solid #e3e8ef; border-radius: 999px;
-            padding: .3rem .85rem; font-size: .85rem; font-weight: 500; color: #64748b;
-            margin: 0;
-          }
-          .st-key-nav_page label:hover { border-color: #93b4d4; }
-          .st-key-nav_page label:has(input:checked),
-          div[data-testid="stRadioGroup"][aria-label="nav_page"] label:has(input:checked) {
-            background: #1f3a5f; border-color: #1f3a5f; color: #ffffff !important;
-            font-weight: 600;
-          }
-          .st-key-nav_page label:has(input:checked) p,
-          div[data-testid="stRadioGroup"][aria-label="nav_page"] label:has(input:checked) p {
-            color: #ffffff !important;
-          }
-          /* Hide the radio dots themselves - these read as tabs, not options. */
-          .st-key-nav_page div[role="radiogroup"] > label > div:first-child,
-          div[data-testid="stRadioGroup"][aria-label="nav_page"] > label > div:first-child {
-            display: none;
-          }
+          /* Navigation now uses st.segmented_control (native tab-like
+             widget), not a CSS-hacked radio - no custom selector rules
+             needed here. See the "Navigation" section below for how
+             programmatic jumps (the scorecard's "Open ->" buttons) still
+             work by pre-setting st.session_state before the widget renders. */
 
           /* Scorecard */
           .score-ring {
@@ -1443,16 +1396,8 @@ def build_model_size_summary(model: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ==========================================================================
-# DAX formatting / best-practice rewrite
+# DAX tokenizer (shared infrastructure for every DAX-aware feature)
 # ==========================================================================
-
-DAX_KEYWORDS = {"VAR", "RETURN", "IN", "NOT", "AND", "OR", "TRUE", "FALSE", "BLANK"}
-BREAKING_FUNCTIONS = {
-    "CALCULATE", "CALCULATETABLE", "SUMX", "AVERAGEX", "MINX", "MAXX", "COUNTX",
-    "FILTER", "SUMMARIZE", "ADDCOLUMNS", "IF", "SWITCH", "COALESCE", "DIVIDE",
-    "TREATAS", "SELECTCOLUMNS", "GROUPBY", "UNION", "EXCEPT", "INTERSECT",
-}
-
 
 def _tokenize_dax(expr: str) -> List[Tuple[str, str]]:
     """Split DAX into (kind, text) tokens, keeping strings/refs intact."""
@@ -1515,287 +1460,12 @@ def _tokenize_dax(expr: str) -> List[Tuple[str, str]]:
     return tokens
 
 
-def _significant(tokens: List[Tuple[str, str]], idx: int, step: int) -> Optional[Tuple[str, str]]:
-    """Nearest non-whitespace/comment token in the given direction."""
-    j = idx + step
-    while 0 <= j < len(tokens):
-        if tokens[j][0] not in ("ws", "comment"):
-            return tokens[j]
-        j += step
-    return None
-
-
-def optimize_dax(expr: str, measure_names: Set[str], column_tables: Dict[str, Set[str]]) -> Tuple[str, str]:
-    """Rewrite DAX following well-known best practices.
-
-    Applies only changes that are safe and verifiable from model metadata:
-      * measure references are un-qualified   ('T'[M]  ->  [M])
-      * column references are fully qualified ([C]     ->  'T'[C], when unambiguous)
-      * function names are upper-cased
-      * a whole-expression division is converted to DIVIDE()
-      * the result is re-indented
-
-    Returns (rewritten_dax, notes).
-    """
-    if not expr or not expr.strip():
-        return "", ""
-
-    tokens = _tokenize_dax(expr)
-    notes: List[str] = []
-    out: List[Tuple[str, str]] = []
-
-    i = 0
-    while i < len(tokens):
-        kind, text = tokens[i]
-
-        if kind == "table":
-            nxt = _significant(tokens, i, 1)
-            if nxt and nxt[0] == "ref":
-                ref_name = nxt[1][1:-1]
-                if ref_name in measure_names:
-                    # Best practice: don't table-qualify measures.
-                    out.append(("ref", nxt[1]))
-                    notes.append(f"Un-qualified measure reference [{ref_name}]")
-                    j = tokens.index(nxt, i + 1)
-                    i = j + 1
-                    continue
-            out.append((kind, text))
-            i += 1
-            continue
-
-        if kind == "ref":
-            prev = _significant(tokens, i, -1)
-            already_qualified = prev is not None and (
-                prev[0] == "table" or (prev[0] == "ident" and prev[1] not in DAX_KEYWORDS)
-            )
-            ref_name = text[1:-1]
-            if not already_qualified and ref_name not in measure_names:
-                owners = column_tables.get(ref_name, set())
-                if len(owners) == 1:
-                    owner = next(iter(owners))
-                    out.append(("table", f"'{owner}'"))
-                    out.append((kind, text))
-                    notes.append(f"Qualified column reference '{owner}'[{ref_name}]")
-                    i += 1
-                    continue
-                if len(owners) > 1:
-                    notes.append(
-                        f"[{ref_name}] is ambiguous - it exists on {len(owners)} tables; qualify it manually"
-                    )
-            out.append((kind, text))
-            i += 1
-            continue
-
-        if kind == "ident":
-            nxt = _significant(tokens, i, 1)
-            if nxt and nxt[0] == "punct" and nxt[1] == "(" and text.upper() != text:
-                out.append((kind, text.upper()))
-                notes.append("Upper-cased DAX function names")
-                i += 1
-                continue
-            if text.upper() in DAX_KEYWORDS and text.upper() != text:
-                out.append((kind, text.upper()))
-                notes.append("Upper-cased DAX keywords")
-                i += 1
-                continue
-
-        out.append((kind, text))
-        i += 1
-
-    # Whole-expression division -> DIVIDE(), which handles divide-by-zero.
-    rewritten = _maybe_apply_divide(out, notes)
-
-    formatted = _format_dax_tokens(_tokenize_dax(rewritten))
-
-    if re.search(r"IFERROR\s*\(", formatted, re.I):
-        notes.append("IFERROR() found - prefer DIVIDE() or COALESCE(), which are faster")
-    if re.search(r"\bFILTER\s*\(\s*'?[A-Za-z_]", formatted) and "ALL" not in formatted.upper():
-        notes.append("FILTER() over a whole table - consider filtering a single column instead")
-    if "/" in "".join(t for k, t in out if k == "punct") and "DIVIDE" not in formatted.upper():
-        notes.append("Division operator used - consider DIVIDE() to handle division by zero")
-
-    seen: Set[str] = set()
-    unique_notes = [n for n in notes if not (n in seen or seen.add(n))]
-    return formatted, "; ".join(unique_notes)
-
-
-def _maybe_apply_divide(tokens: List[Tuple[str, str]], notes: List[str]) -> str:
-    """Convert `A / B` to `DIVIDE(A, B)` only when it is the entire expression."""
-    depth = 0
-    split_at = None
-    for idx, (kind, text) in enumerate(tokens):
-        if kind == "punct":
-            if text == "(":
-                depth += 1
-            elif text == ")":
-                depth -= 1
-            elif text == "/" and depth == 0:
-                if split_at is not None:  # more than one top-level division
-                    return "".join(t for _, t in tokens)
-                split_at = idx
-
-    if split_at is None:
-        return "".join(t for _, t in tokens)
-
-    left = "".join(t for _, t in tokens[:split_at]).strip()
-    right = "".join(t for _, t in tokens[split_at + 1:]).strip()
-    if not left or not right or "\n" in left or "\n" in right:
-        return "".join(t for _, t in tokens)
-
-    notes.append("Replaced '/' with DIVIDE() to guard against division by zero")
-    return f"DIVIDE({left}, {right})"
-
-
-def _format_dax_tokens(tokens: List[Tuple[str, str]]) -> str:
-    """Re-indent DAX: one argument per line inside breaking functions."""
-    parts: List[str] = []
-    indent = 0
-    stack: List[bool] = []  # True when the paren belongs to a breaking function
-
-    def newline() -> None:
-        parts.append("\n" + "    " * indent)
-
-    prev_significant: Optional[str] = None
-    for idx, (kind, text) in enumerate(tokens):
-        if kind == "ws":
-            if "\n" in text and parts and not parts[-1].endswith("\n"):
-                continue  # existing newlines are re-created by the formatter
-            if parts and not parts[-1].endswith((" ", "\n", "(")):
-                parts.append(" ")
-            continue
-
-        if kind == "comment":
-            # A `--` comment runs to end of line, so the next token MUST start
-            # on a new line - otherwise the comment swallows real code and the
-            # rewritten DAX becomes invalid.
-            if parts and not parts[-1].endswith(("\n", " ")):
-                parts.append(" ")
-            parts.append(text.rstrip())
-            if text.lstrip().startswith("--"):
-                newline()
-        elif kind == "punct" and text == "(":
-            is_breaking = (prev_significant or "").upper() in BREAKING_FUNCTIONS
-            stack.append(is_breaking)
-            parts.append("(")
-            if is_breaking:
-                indent += 1
-                newline()
-        elif kind == "punct" and text == ")":
-            was_breaking = stack.pop() if stack else False
-            if was_breaking:
-                indent = max(0, indent - 1)
-                newline()
-            parts.append(")")
-        elif kind == "punct" and text == "{":
-            # A brace list like IN {"a","b"} is a single value - never split it.
-            stack.append(False)
-            parts.append("{")
-        elif kind == "punct" and text == "}":
-            if stack:
-                stack.pop()
-            parts.append("}")
-        elif kind == "punct" and text == ",":
-            parts.append(",")
-            if stack and stack[-1]:
-                newline()
-            else:
-                parts.append(" ")
-        elif kind == "ident" and text.upper() in ("VAR", "RETURN"):
-            if parts and "".join(parts).strip():
-                parts.append("\n" + "    " * indent)
-            parts.append(text)
-            parts.append(" ")
-        elif kind == "punct" and text in "=<>+-*/&":
-            # Binary operators read better with surrounding spaces.
-            if parts and not parts[-1].endswith((" ", "\n")):
-                parts.append(" ")
-            parts.append(text)
-            parts.append(" ")
-        else:
-            if parts and parts[-1].endswith(","):
-                parts.append(" ")
-            parts.append(text)
-
-        if kind not in ("ws", "comment"):
-            prev_significant = text
-
-    return _tidy_outside_literals("".join(parts)).strip()
-
-
-def _tidy_outside_literals(text: str) -> str:
-    """Apply whitespace/operator clean-ups, but never inside a literal.
-
-    Table names and string literals may legitimately contain runs of spaces
-    (e.g. 'LocationDim  Connect with ...'). Rewriting those would point the
-    DAX at a table that does not exist, so quoted spans are copied verbatim.
-    """
-    out: List[str] = []
-    buf: List[str] = []
-
-    def flush() -> None:
-        if not buf:
-            return
-        chunk = "".join(buf)
-        # Collapse mid-line space runs; leading indentation must survive.
-        chunk = re.sub(r"(?<=\S)[ \t]{2,}", " ", chunk)
-        chunk = re.sub(r"[ \t]+\n", "\n", chunk)
-        chunk = re.sub(r"\n{3,}", "\n\n", chunk)
-        chunk = re.sub(r"\(\s*\n\s*\)", "()", chunk)
-        # Re-pair comparison operators split by the tokenizer.
-        chunk = re.sub(r"<\s*=", "<=", chunk)
-        chunk = re.sub(r">\s*=", ">=", chunk)
-        chunk = re.sub(r"<\s*>", "<>", chunk)
-        out.append(chunk)
-        buf.clear()
-
-    i, n = 0, len(text)
-    while i < n:
-        ch = text[i]
-        if ch == "'":  # quoted table name
-            flush()
-            j = text.find("'", i + 1)
-            j = n - 1 if j == -1 else j
-            out.append(text[i:j + 1])
-            i = j + 1
-        elif ch == '"':  # string literal ("" escapes a quote)
-            flush()
-            j = i + 1
-            while j < n:
-                if text[j] == '"':
-                    if j + 1 < n and text[j + 1] == '"':
-                        j += 2
-                        continue
-                    break
-                j += 1
-            j = n - 1 if j >= n else j
-            out.append(text[i:j + 1])
-            i = j + 1
-        else:
-            buf.append(ch)
-            i += 1
-    flush()
-    return "".join(out)
-
-
-def _same_dax(a: str, b: str) -> bool:
-    """True if two DAX snippets differ only by formatting.
-
-    The rewriter always re-indents and re-spaces operators, so comparing raw
-    strings - or even whitespace-collapsed strings - would flag every row as
-    'changed'. Comparing the non-whitespace token streams ignores layout
-    entirely and leaves only genuine edits (renamed refs, DIVIDE, casing).
-    """
-    def tokens(s: str) -> List[str]:
-        return [t for k, t in _tokenize_dax(str(s or "")) if k not in ("ws", "comment")]
-    return tokens(a) == tokens(b)
-
-
 def find_referenced_measures(expr: str, measure_names: Set[str]) -> Set[str]:
     """Measure names a DAX expression calls, e.g. `[Total Sales] * 1.1`.
 
-    Mirrors the measure-vs-column distinction `optimize_dax` already makes
-    (a `[Ref]` token is a measure reference when its bare name is in
-    `measure_names`) - just collecting instead of rewriting.
+    A `[Ref]` token is a measure reference when its bare name is in
+    `measure_names` - the same test `find_referenced_columns` below uses to
+    rule measure references *out* when resolving column references.
     """
     if not expr:
         return set()
@@ -1832,36 +1502,6 @@ def find_referenced_columns(
         if len(owners) == 1:
             found.add((next(iter(owners)), name))
     return found
-
-
-@st.cache_data(show_spinner=False)
-def add_optimized_dax(df: pd.DataFrame, expr_col: str, measure_names: Set[str],
-                      column_tables: Dict[str, Set[str]]) -> pd.DataFrame:
-    """Append best-practice DAX + notes columns to a measures/columns frame.
-
-    Rows whose rewrite is equivalent to the original are left blank, and if
-    nothing in the frame changed at all both columns are omitted entirely.
-    """
-    if df.empty or expr_col not in df.columns:
-        return df
-
-    result = df.copy()
-    rewritten, notes = [], []
-    for expr in result[expr_col]:
-        new_expr, note = optimize_dax(str(expr or ""), measure_names, column_tables)
-        if _same_dax(new_expr, expr):
-            rewritten.append("")   # nothing to suggest for this row
-            notes.append("")
-        else:
-            rewritten.append(new_expr)
-            notes.append(note)
-
-    if not any(rewritten):
-        return result  # no row benefits - don't show the columns at all
-
-    result["DAX (Best Practice)"] = rewritten
-    result["Best-Practice Notes"] = notes
-    return result
 
 
 # ==========================================================================
@@ -2633,6 +2273,18 @@ def run_health_checks(model: Dict[str, Any]) -> pd.DataFrame:
             "relationship bi-directional for the whole model.",
         )
 
+    for _, r in rel_df[(rel_df["From Cardinality"] == "Many") & (rel_df["To Cardinality"] == "Many")].iterrows():
+        add(
+            "Many-to-many relationship", f'{r["From Table"]} ↔ {r["To Table"]}', "Medium",
+            "Both sides are Many, so the engine can't use this join directly — it resolves the "
+            "filter by building a large temporary table at query time, which gets expensive as "
+            "either table grows.",
+            "Where possible, replace it with a bridge (dimension) table related One-to-Many to "
+            "both sides. If a true many-to-many is unavoidable, keep both tables' row counts "
+            "small or resolve the relationship inside the measure with TREATAS() instead of "
+            "relying on the model relationship for every query.",
+        )
+
     calc_df = model["calc_columns"]
     for _, r in calc_df.iterrows():
         expr = str(r.get("ColumnExpression") or "").upper()
@@ -3118,6 +2770,37 @@ def build_fabric_readiness(model: Dict[str, Any]) -> pd.DataFrame:
                     "Fix": "Set IsAvailableInMDX to false on hidden columns — the Fix Script "
                            "tab generates this for you.",
                 })
+
+    # String-typed, high-cardinality relationship keys bloat the VertiPaq
+    # dictionary and are a common trigger for breaching F-SKU guardrails -
+    # Fabric's own guidance is to replace them with integer surrogate keys.
+    cardinality_col = _name_column(cols, *_VPA_CARDINALITY_CANDIDATES)
+    if not cols.empty and cardinality_col and "DataType" in cols.columns and {"TableName", "ColumnName"}.issubset(cols.columns):
+        key_pairs = set()
+        for _, r in model["relationships"].iterrows():
+            key_pairs.add((r["From Table"], r["From Column"]))
+            key_pairs.add((r["To Table"], r["To Column"]))
+        lookup = cols.dropna(subset=["TableName", "ColumnName"]).set_index(["TableName", "ColumnName"])
+        string_keys = []
+        for table, col in key_pairs:
+            if (table, col) not in lookup.index:
+                continue
+            row = lookup.loc[(table, col)]
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[0]
+            card = pd.to_numeric(row.get(cardinality_col), errors="coerce")
+            if str(row.get("DataType")) == "String" and pd.notna(card) and card > 100_000:
+                string_keys.append(f"{table}[{col}] (~{int(card):,})")
+        if string_keys:
+            rows.append({
+                "Check": "String-typed surrogate key", "Object": ", ".join(sorted(string_keys)[:8]),
+                "Severity": "Medium",
+                "Finding": f"{len(string_keys)} relationship key(s) are high-cardinality text. "
+                           "Text keys build a much larger dictionary than an equivalent integer "
+                           "key and are a common reason a model breaches its F-SKU guardrail.",
+                "Fix": "Generate a surrogate BIGINT key upstream (identity column or hashed-to-"
+                       "int in the ETL) and relate on that instead of the natural text key.",
+            })
 
     # Direct Lake can't do bi-di relationships against a fallback-free model
     # reliably, and they're a correctness risk regardless.
@@ -5260,6 +4943,336 @@ def show_table(
 
 
 # ==========================================================================
+# AI DAX Assistant (bring-your-own-key LLM regeneration)
+# ==========================================================================
+# Nothing here runs without the user explicitly supplying their own API key
+# for this browser session. The key, the DAX, and the schema summary sent to
+# the provider are never written to disk - the key lives only in
+# st.session_state (server-side, in-memory, cleared when the session ends).
+# Regeneration is advisory only: this app has no way to write back into a
+# .vpax or Model.bim, so the result is something to review and copy into
+# Tabular Editor or Power BI Desktop yourself - never applied automatically.
+
+LLM_PROVIDERS: Dict[str, Dict[str, str]] = {
+    "OpenAI (ChatGPT)": {"default_model": "gpt-4o-mini"},
+    "Anthropic (Claude)": {"default_model": "claude-3-5-sonnet-20241022"},
+}
+
+
+class LLMError(Exception):
+    """Any problem calling an LLM provider - always caught and shown via
+    st.error, never left to crash the page."""
+
+
+def _compact_schema_summary(model: Dict[str, Any], max_tables: int = 40, max_cols_per_table: int = 25) -> str:
+    """A bounded, plain-text schema summary for an LLM prompt.
+
+    A full schema on a large model can run to hundreds of columns - capping
+    both dimensions keeps prompt size (and the cost/latency of the call)
+    predictable without silently truncating mid-table.
+    """
+    cols_by_table: Dict[str, List[str]] = {}
+    cdf = _user_facing_columns(model["columns"])
+    if {"TableName", "ColumnName"}.issubset(cdf.columns):
+        for _, r in cdf.dropna(subset=["ColumnName"]).iterrows():
+            cols_by_table.setdefault(str(r["TableName"]), []).append(str(r["ColumnName"]))
+
+    all_tables = model["all_table_names"]
+    lines = []
+    for t in all_tables[:max_tables]:
+        cols = cols_by_table.get(t, [])
+        shown = cols[:max_cols_per_table]
+        extra = f", … +{len(cols) - len(shown)} more" if len(cols) > len(shown) else ""
+        lines.append(f"- {t}: {', '.join(shown)}{extra}" if shown else f"- {t}")
+    if len(all_tables) > max_tables:
+        lines.append(f"… +{len(all_tables) - max_tables} more tables")
+
+    rel_lines = []
+    rel_df = model["relationships"]
+    for _, r in rel_df.head(60).iterrows():
+        rel_lines.append(
+            f"{r['From Table']}[{r['From Column']}] -> {r['To Table']}[{r['To Column']}] "
+            f"({r['From Cardinality']}-to-{r['To Cardinality']}, "
+            f"{'bi-directional' if r['Cross Filter Direction'] == 'Both' else 'single-direction'}"
+            f"{'' if r['Active'] else ', inactive'})"
+        )
+    other_measures = sorted(model["measure_names"])[:80]
+
+    return (
+        "Tables and columns:\n" + "\n".join(lines)
+        + "\n\nRelationships:\n" + ("\n".join(rel_lines) if rel_lines else "(none)")
+        + "\n\nOther measure names available to reference:\n"
+        + (", ".join(other_measures) if other_measures else "(none)")
+    )
+
+
+def build_dax_regeneration_prompt(
+    object_kind: str, table: str, name: str, expression: str, model: Dict[str, Any]
+) -> str:
+    schema = _compact_schema_summary(model)
+    return f"""You are a senior Power BI / DAX consultant reviewing one {object_kind} in an existing semantic model.
+
+{object_kind.capitalize()} name: {name}
+Home table: {table}
+Current DAX:
+{expression}
+
+Model schema (for context - do not invent tables/columns/measures that aren't listed):
+{schema}
+
+Rewrite this {object_kind}'s DAX to follow current DAX best practices (e.g. fully-qualified column
+references, un-qualified measure references, DIVIDE() instead of "/", explicit CALCULATE filters
+rather than relying on implicit row context where it helps clarity, avoiding unnecessary iterators).
+Specifically check for and fix these well-known engine-level anti-patterns where they apply:
+- CALCULATE (or any measure reference, which triggers an implicit CALCULATE) inside a row iterator
+  like SUMX/AVERAGEX/FILTER over a large table forces a context transition on every row - replace
+  with a native scalar expression over the iterator's own row context where the logic allows it
+  (e.g. SUMX(Sales, Sales[Qty] * Sales[Price]) instead of SUMX(Sales, CALCULATE(SUM(Sales[Qty])) * Sales[Price])).
+- A filter argument inside CALCULATE that should narrow an *existing* filter rather than replace it
+  (CALCULATE implicitly does ALL() on the filtered column) needs KEEPFILTERS to intersect instead of
+  override.
+- A sub-expression referenced more than once anywhere in the measure (across IF/SWITCH branches or
+  repeated elsewhere) should be hoisted into a VAR so it's evaluated once and short-circuits, not
+  recomputed per reference.
+- Row-by-row text matching (SEARCH, CONTAINSSTRING) or complex conditional logic inside a
+  high-cardinality iterator forces expensive Storage-Engine-to-Formula-Engine callbacks
+  (CallbackDataID) - flag this in notes even if you can't fully eliminate it, since it often means
+  the logic belongs upstream in the data model instead.
+Keep the result logically equivalent unless you believe the original has an actual bug - call that
+out explicitly in your notes if so.
+
+Also consider whether the *data model* itself (not just this expression) could be improved to make
+this {object_kind} simpler, faster, or more reliable - e.g. a missing relationship, a column that
+should be added upstream, a role this {object_kind} plays that suggests a modelling change. Only
+suggest changes grounded in the schema above - never invent objects that aren't listed.
+
+Respond with ONLY a single JSON object (no markdown fences, no commentary outside the JSON), with
+exactly these keys:
+{{
+  "revised_dax": "the rewritten DAX expression, or the original if no change is warranted",
+  "notes": "a short explanation of what changed and why, or why nothing changed",
+  "model_suggestions": "any data-modelling changes worth considering, or an empty string if none"
+}}"""
+
+
+def build_insights_prompt(model: Dict[str, Any], score: int, grade: str, cards: List[Dict[str, Any]]) -> str:
+    """Synthesize the Scorecard's already-computed per-section findings into
+    one prompt - the LLM prioritizes and explains, it never re-derives the
+    findings themselves, so it can't invent a problem the rule engine didn't
+    actually find."""
+    schema = _compact_schema_summary(model, max_tables=25, max_cols_per_table=10)
+    lines = []
+    for c in cards:
+        bits = ", ".join(f"{s}: {c['counts'][s]}" for s in ("High", "Medium", "Low") if c["counts"].get(s))
+        lines.append(f"- {c['page']} ({c['title']}) — worst: {c['worst']}" + (f" [{bits}]" if bits else " — clean"))
+    findings = "\n".join(lines) if lines else "(no sections evaluated)"
+
+    return f"""You are a senior Power BI / DAX consultant giving a busy stakeholder a fast, honest read on
+a semantic model's health, based only on the automated checks below - not a full manual review.
+
+Overall score: {score}/100 ({grade})
+
+Findings by section (severity = worst finding in that section, counts in brackets):
+{findings}
+
+Model schema (abbreviated, for context only):
+{schema}
+
+Write a short, prioritized summary in markdown with exactly these three headings:
+### Bottom line
+One or two plain-language sentences. No hedging, no filler.
+
+### Fix first
+The highest-impact items to address (at most 5), each one line, naming the exact section to open
+(e.g. "Audit -> Model Health") and why it matters for this specific model.
+
+### Can wait
+Anything flagged but genuinely low-risk, so the reader knows what to skip for now.
+
+Be concrete and specific to what's actually listed above. Never invent a finding, section, table, or
+column that isn't listed above."""
+
+
+def _http_post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout: int = 60) -> Dict[str, Any]:
+    """Minimal JSON-over-HTTPS POST via the standard library - deliberately
+    not an extra SDK dependency for a bring-your-own-key, opt-in feature."""
+    import urllib.error
+    import urllib.request
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={**headers, "Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="ignore")
+        try:
+            detail = json.loads(body).get("error", {}).get("message", body)
+        except (json.JSONDecodeError, AttributeError):
+            detail = body
+        if exc.code == 401:
+            raise LLMError(
+                "That API key was rejected (401 Unauthorized). Double-check you copied it correctly."
+            ) from exc
+        if exc.code == 429:
+            raise LLMError(
+                "Rate limited (429) - wait a moment and try again, or check your plan's usage limits."
+            ) from exc
+        raise LLMError(f"API error {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise LLMError(f"Network error reaching the API: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise LLMError("The request timed out - the model may be under heavy load; try again.") from exc
+
+
+def call_openai(api_key: str, model_id: str, prompt: str) -> str:
+    result = _http_post_json(
+        "https://api.openai.com/v1/chat/completions",
+        {"Authorization": f"Bearer {api_key}"},
+        {
+            "model": model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"},
+        },
+    )
+    try:
+        return result["choices"][0]["message"]["content"]
+    except (KeyError, IndexError) as exc:
+        raise LLMError(f"Unexpected response shape from OpenAI: {result}") from exc
+
+
+def call_anthropic(api_key: str, model_id: str, prompt: str) -> str:
+    result = _http_post_json(
+        "https://api.anthropic.com/v1/messages",
+        {"x-api-key": api_key, "anthropic-version": "2023-06-01"},
+        {"model": model_id, "max_tokens": 2000, "messages": [{"role": "user", "content": prompt}]},
+    )
+    try:
+        return "".join(block.get("text", "") for block in result["content"] if block.get("type") == "text")
+    except (KeyError, TypeError) as exc:
+        raise LLMError(f"Unexpected response shape from Anthropic: {result}") from exc
+
+
+def _llm_ready() -> bool:
+    return bool(st.session_state.get("llm_api_key", "").strip())
+
+
+def call_llm(prompt: str) -> str:
+    """Dispatch to whichever provider/key/model is configured in the
+    sidebar's AI assistant section - the one place every AI feature reads
+    its credentials from, so a key entered once works everywhere."""
+    provider = st.session_state.get("llm_provider") or next(iter(LLM_PROVIDERS))
+    api_key = st.session_state.get("llm_api_key", "").strip()
+    if not api_key:
+        raise LLMError("No API key configured — set one in the sidebar's AI assistant section.")
+    model_id = st.session_state.get("llm_model_id_active", "").strip() or LLM_PROVIDERS[provider]["default_model"]
+    if provider == "OpenAI (ChatGPT)":
+        return call_openai(api_key, model_id, prompt)
+    return call_anthropic(api_key, model_id, prompt)
+
+
+def regenerate_dax_with_llm(
+    object_kind: str, table: str, name: str, expression: str, model: Dict[str, Any],
+) -> Dict[str, str]:
+    """Call the configured LLM and parse its JSON reply.
+
+    Includes a defensive fallback for when the model wraps its JSON in a
+    markdown code fence or adds stray commentary around it - common enough
+    behaviour, even when explicitly asked for JSON only, that silently
+    failing on it would make this feature unreliable.
+    """
+    prompt = build_dax_regeneration_prompt(object_kind, table, name, expression, model)
+    raw = call_llm(prompt)
+
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I).strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.S)
+        if not match:
+            raise LLMError(f"The model didn't return parseable JSON. Raw reply:\n\n{raw[:2000]}")
+        try:
+            parsed = json.loads(match.group(0))
+        except json.JSONDecodeError as exc:
+            raise LLMError(f"The model's JSON couldn't be parsed. Raw reply:\n\n{raw[:2000]}") from exc
+
+    return {
+        "revised_dax": str(parsed.get("revised_dax") or "").strip(),
+        "notes": str(parsed.get("notes") or "").strip(),
+        "model_suggestions": str(parsed.get("model_suggestions") or "").strip(),
+    }
+
+
+def render_ai_dax_assistant(
+    object_kind: str, df: pd.DataFrame, name_col: str, expr_col: str, model: Dict[str, Any], key_prefix: str
+) -> None:
+    """Per-object 'Regenerate DAX' panel, shared by the Measures and
+    Calculated Columns pages. Reads its provider/key/model from the sidebar's
+    AI assistant section - set once there, used everywhere."""
+    with st.expander(f"AI DAX Assistant — regenerate a {object_kind}'s DAX with your configured LLM",
+                      icon=":material/smart_toy:", expanded=True):
+        st.caption(
+            f"Sends the selected {object_kind}'s DAX, plus a compact summary of this model's "
+            "tables, columns and relationships, to the provider configured in the sidebar, and "
+            "asks it to rewrite the DAX following best practice and suggest any data-modelling "
+            "changes worth considering. **Nothing is applied automatically** — this app has no "
+            "way to write back into a .vpax, so review the result and copy it into Tabular "
+            "Editor or Power BI Desktop yourself."
+        )
+        if not _llm_ready():
+            st.info(
+                "Set an OpenAI or Claude API key in the sidebar's **AI assistant** section to "
+                "use this.", icon=":material/key:",
+            )
+            return
+
+        options = df[name_col].dropna().astype(str).tolist()
+        if not options:
+            st.info(f"No {object_kind}s to regenerate.")
+            return
+        picked = st.selectbox(f"Choose a {object_kind}", options, key=f"{key_prefix}_pick")
+        row = df[df[name_col].astype(str) == picked].iloc[0]
+        table = str(row.get("TableName") or "")
+        expr = str(row.get(expr_col) or "")
+        # Included in the cache key so a picked object whose DAX changed
+        # (e.g. after re-uploading a different .vpax) doesn't show a stale
+        # suggestion generated against the old expression.
+        cache_key = f"{key_prefix}_result_{picked}_{hash(expr) & 0xffffffff}"
+
+        provider = st.session_state.get("llm_provider") or next(iter(LLM_PROVIDERS))
+        if st.button("✨ Regenerate with AI", key=f"{key_prefix}_go", width="stretch"):
+            with st.spinner(f"Asking {provider} to review {picked}…"):
+                try:
+                    result = regenerate_dax_with_llm(object_kind, table, picked, expr, model)
+                    st.session_state[cache_key] = result
+                except LLMError as exc:
+                    st.error(str(exc))
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Unexpected error calling {provider}: {exc}")
+
+        result = st.session_state.get(cache_key)
+        if result:
+            d1, d2 = st.columns(2)
+            with d1:
+                st.markdown("**Current**")
+                st.code(expr or "(empty)", language="dax")
+            with d2:
+                st.markdown("**AI-suggested**")
+                st.code(result["revised_dax"] or "(no change suggested)", language="dax")
+            if result["notes"]:
+                st.markdown("**Notes**")
+                st.write(result["notes"])
+            if result["model_suggestions"]:
+                st.markdown("**Model-change suggestions**")
+                st.info(result["model_suggestions"], icon=":material/lightbulb:")
+
+
+# ==========================================================================
 # UI
 # ==========================================================================
 
@@ -5280,25 +5293,29 @@ st.markdown(
 
 with st.sidebar:
     st.markdown('<div class="sb-title">⚙️ Data source</div>', unsafe_allow_html=True)
-    with st.expander("📁 Upload .vpax file", expanded=True):
+    with st.expander("Upload .vpax file", expanded=True, icon=":material/upload_file:"):
         uploaded = st.file_uploader("Choose a .vpax file", type=["vpax"], label_visibility="collapsed")
         st.caption(
             "Export from **DAX Studio** (Advanced ➜ Export Metadata) or "
             "**Tabular Editor** (File ➜ Export ➜ Metadata)."
         )
         if st.button(
-            "🧪 Try a sample model", width="stretch", key="btn_sample",
+            "Try a sample model", width="stretch", key="btn_sample",
+            icon=":material/science:",
             help="Loads a small built-in star schema so you can see every section "
                  "without exporting anything first.",
         ):
             st.session_state["use_sample"] = True
-    with st.expander("🖥️ Add report pages (.pbix) — optional"):
-        pbix_file = st.file_uploader("Choose a .pbix file", type=["pbix"], label_visibility="collapsed")
-        st.caption(
-            "A .vpax holds the **semantic model only** and carries no report pages. "
-            "Add the .pbix to list the real pages and see the model per page."
+    with st.expander("Add report pages (.pbix or .pbit) — optional", icon=":material/dashboard:"):
+        pbix_file = st.file_uploader(
+            "Choose a .pbix or .pbit file", type=["pbix", "pbit"], label_visibility="collapsed"
         )
-    with st.expander("🆚 Compare against a baseline (.vpax) — optional"):
+        st.caption(
+            "A .vpax holds the **semantic model only** and carries no report pages. Add a "
+            "**.pbix** (a real report) or a **.pbit** (a template — same report layout, no "
+            "data) to list the real pages and see the model per page."
+        )
+    with st.expander("Compare against a baseline (.vpax) — optional", icon=":material/compare_arrows:"):
         baseline_file = st.file_uploader(
             "Choose the certified/baseline .vpax", type=["vpax"],
             label_visibility="collapsed", key="baseline_upload",
@@ -5307,6 +5324,30 @@ with st.sidebar:
             "Upload the **certified** model here and your working model above. "
             "The *Model Compare* section then shows which measures have drifted."
         )
+
+    st.markdown('<div class="sb-title" style="margin-top:1rem">AI assistant</div>', unsafe_allow_html=True)
+    with st.expander("Connect your own OpenAI or Claude key — optional", icon=":material/smart_toy:"):
+        st.caption(
+            "Set this once and it powers every AI feature in the app — the Scorecard's AI "
+            "Insights and the DAX Assistant on Measures/Calculated Columns. Nothing is sent "
+            "anywhere until you click a **Generate**/**Regenerate** button. Your key is kept "
+            "only in this session's server-side memory and is never written to disk."
+        )
+        llm_provider = st.selectbox("Provider", list(LLM_PROVIDERS), key="llm_provider")
+        st.text_input(
+            "API key", type="password", key="llm_api_key",
+            placeholder="sk-…" if llm_provider.startswith("OpenAI") else "sk-ant-…",
+        )
+        # Keyed per-provider so switching providers doesn't leave the other
+        # provider's model id sitting in the box; mirrored into a
+        # provider-agnostic key so downstream code has one stable place to
+        # read the active model id from regardless of which provider is set.
+        llm_model_id = st.text_input(
+            "Model", value=LLM_PROVIDERS[llm_provider]["default_model"],
+            key=f"llm_model_id_{llm_provider}",
+            help="Override with a specific model version if you need one other than the default.",
+        )
+        st.session_state["llm_model_id_active"] = llm_model_id
 
 # A real upload always wins over the sample, so the sample never sticks
 # around confusingly once the user brings their own file.
@@ -5322,7 +5363,7 @@ else:
 if source_bytes is None:
     st.info(
         "👈 Upload a **.vpax** file from the sidebar to get started — or hit "
-        "**🧪 Try a sample model** to explore with a built-in one."
+        "**Try a sample model** to explore with a built-in one."
     )
     st.markdown(f'<div class="app-footer">{AUTHOR}</div>', unsafe_allow_html=True)
     st.stop()
@@ -5401,7 +5442,7 @@ def tab_guard(tab_name: str):
         yield
     except Exception as exc:  # noqa: BLE001
         st.error(f"Something went wrong rendering **{tab_name}**: `{type(exc).__name__}: {exc}`")
-        with st.expander("Technical details"):
+        with st.expander("Technical details", icon=":material/code:"):
             st.code(traceback.format_exc(), language="text")
         st.caption(
             "The other tabs are unaffected. If this looks like a bug, the details above "
@@ -5582,35 +5623,46 @@ def _badge(counts: Dict[str, int]) -> str:
 
 
 with st.sidebar:
-    st.markdown('<div class="sb-title">🧭 Sections</div>', unsafe_allow_html=True)
-    nav_group = st.radio(
-        "nav_group", list(NAV_GROUPS),
-        format_func=lambda g: g + ("" if g == "🧭 Overview" else _badge(_group_severity_counts(g))),
-        key="nav_group", label_visibility="collapsed",
-    )
-    st.caption("🔴 high · 🟠 medium · ⚪ low · 🟢 clear")
-
-    st.markdown('<div class="sb-title" style="margin-top:1rem">🔎 Find anything</div>',
-                unsafe_allow_html=True)
+    st.markdown('<div class="sb-title">🔎 Find anything</div>', unsafe_allow_html=True)
     search_term = st.text_input(
         "search", placeholder="table, column or measure…",
         label_visibility="collapsed", key="global_search",
     )
 
+# Sections live as a two-tier segmented control (group, then page within it)
+# right below the header, not in the sidebar - the sidebar is reserved for
+# data-source uploads and the global search. st.segmented_control returns
+# None on first render unless a `default` is given, but Streamlit also warns
+# if `default` is passed once the key already has a session_state entry - so
+# `default` is only supplied on the very first render for that key. On every
+# later render (including a scorecard "Open ->" jump, which pre-sets
+# st.session_state[key] before the widget runs) the existing value wins,
+# same as st.radio before it.
+group_options = list(NAV_GROUPS)
+nav_group = st.segmented_control(
+    "Sections", group_options,
+    format_func=lambda g: g + ("" if g == "🧭 Overview" else _badge(_group_severity_counts(g))),
+    key="nav_group", label_visibility="collapsed", required=True,
+    default=group_options[0] if "nav_group" not in st.session_state else None,
+    width="stretch",
+)
+
 _pages = NAV_GROUPS[nav_group]
-# Keep the page selection valid when the group changes. Setting the key
-# before the widget is created is the supported way to steer a Streamlit
-# radio programmatically, and is what makes the scorecard cards clickable.
 if st.session_state.get("nav_page") not in _pages:
     st.session_state["nav_page"] = _pages[0]
 
 if len(_pages) > 1:
-    nav_page = st.radio(
-        "nav_page", _pages, horizontal=True, key="nav_page", label_visibility="collapsed",
+    nav_page = st.segmented_control(
+        "Pages", _pages, key="nav_page", label_visibility="collapsed",
         format_func=lambda p: p + (_badge(_page_severity_counts(p)) if p in PAGE_FINDINGS else ""),
+        required=True,
+        default=_pages[0] if "nav_page" not in st.session_state else None,
+        width="stretch",
     )
 else:
     nav_page = _pages[0]
+
+st.caption("🔴 high severity · 🟠 medium · ⚪ low · 🟢 clear")
 
 # --- Global search ------------------------------------------------------------
 if search_term and search_term.strip():
@@ -5643,7 +5695,7 @@ if search_term and search_term.strip():
             show_table(pd.DataFrame(hits), f"search_{_slug(search_term)}", height=320, key="search_hits")
             st.caption("Use **Investigate ➜ Impact Analysis** to see what references any of these "
                        "before you rename or delete it.")
-        st.divider()
+        st.space("large")
 
 
 # --- Model Scorecard ----------------------------------------------------------
@@ -5717,6 +5769,31 @@ if nav_page == "Model Scorecard":
             else:
                 st.success("No high or medium findings. This model is in good shape.", icon="✅")
 
+        with st.expander("AI insights — a prioritized summary of everything below",
+                          icon=":material/smart_toy:", expanded=True):
+            if not _llm_ready():
+                st.caption(
+                    "Set an OpenAI or Claude API key in the sidebar's **AI assistant** section "
+                    "to turn the raw findings below into a short, prioritized, plain-language "
+                    "summary — what to fix first and what can wait."
+                )
+            else:
+                findings_fingerprint = "|".join(f"{c['page']}:{c['worst']}:{sum(c['counts'].values())}" for c in cards)
+                insights_key = f"scorecard_insights_{score}_{hash(findings_fingerprint) & 0xffffffff}"
+                provider = st.session_state.get("llm_provider") or next(iter(LLM_PROVIDERS))
+                if st.button("✨ Generate AI insights", key="scorecard_insights_go"):
+                    with st.spinner(f"Asking {provider} to review this model…"):
+                        try:
+                            prompt = build_insights_prompt(model, score, grade, cards)
+                            st.session_state[insights_key] = call_llm(prompt)
+                        except LLMError as exc:
+                            st.error(str(exc))
+                        except Exception as exc:  # noqa: BLE001
+                            st.error(f"Unexpected error calling {provider}: {exc}")
+                insight_text = st.session_state.get(insights_key)
+                if insight_text:
+                    st.markdown(insight_text)
+
         st.markdown("#### Where the findings are")
         cards.sort(key=lambda c: (SEVERITY_ORDER.get(c["worst"], 9),
                                   -sum(c["counts"].values())))
@@ -5737,7 +5814,7 @@ if nav_page == "Model Scorecard":
                 on_click=_goto, args=(_page_group(c["page"]), c["page"]),
             )
 
-        with st.expander("📋 Guided review checklist — first pass on an unfamiliar model"):
+        with st.expander("Guided review checklist — first pass on an unfamiliar model", icon=":material/checklist:"):
             st.markdown(
                 "Work top to bottom. Each step names the section that answers it.\n\n"
                 "1. **Does it load and what's in it?** — *Explore ➜ Tables* and *Measures*.\n"
@@ -6095,12 +6172,23 @@ if nav_page == "Semantic Model by Screen":
 if nav_page == "Tables":
     with tab_guard('Tables'):
         st.subheader("Tables in the model")
+        st.caption(
+            "Every table the .vpax export knows about, with whatever metadata came with it "
+            "(row count, description, storage mode). Use this as a starting inventory before "
+            "diving into a specific table's columns or relationships."
+        )
         show_table(model["tables"], "Tables", height=420, key="tables", row_height=90)
 
 # --- Columns / Schema -----------------------------------------------------
 if nav_page == "Columns / Schema":
     with tab_guard('Columns / Schema'):
         st.subheader("Columns per table")
+        st.caption(
+            "Every column across every table, including hidden ones and VertiPaq's internal "
+            "RowNumber columns (unlike the audit tabs, which filter those out as noise). Filter "
+            "to one or a few tables below, or use **Explore ➜ Impact Analysis** once you've "
+            "found a specific column you're thinking about changing."
+        )
         schema_df = model["columns"]
         if schema_df.empty:
             st.info("No column metadata found.")
@@ -6123,20 +6211,19 @@ if nav_page == "Measures":
         if meas_df.empty:
             st.info("No measures found in this model.")
         else:
-            enriched = add_optimized_dax(meas_df, "MeasureExpression", model["measure_names"], model["column_tables"])
-            changed = int((enriched["DAX (Best Practice)"] != "").sum()) if "DAX (Best Practice)" in enriched.columns else 0
             st.caption(
-                "**DAX (Best Practice)** applies safe, verifiable fixes: measures un-qualified, "
-                "columns fully qualified, functions upper-cased, and whole-expression division "
-                "converted to DIVIDE(). Rows already following best practice are left blank — "
-                f"{changed} of {len(enriched)} measures have a suggestion. Review before applying."
+                "Every measure's DAX, as stored in the model. Use the AI DAX Assistant above to "
+                "get a best-practice rewrite and modelling suggestions for one measure at a time."
+            )
+            render_ai_dax_assistant(
+                "measure", meas_df, "MeasureName", "MeasureExpression", model, key_prefix="ai_meas"
             )
             search = st.text_input("Search measure name or expression…", key="measure_search")
-            view = enriched
+            view = meas_df
             if search:
-                view = enriched[
-                    enriched["MeasureName"].str.contains(search, case=False, na=False)
-                    | enriched["MeasureExpression"].str.contains(search, case=False, na=False)
+                view = meas_df[
+                    meas_df["MeasureName"].str.contains(search, case=False, na=False)
+                    | meas_df["MeasureExpression"].str.contains(search, case=False, na=False)
                 ]
             show_table(view.reset_index(drop=True), "Measures", height=460, key="measures", row_height=130)
 
@@ -6144,17 +6231,32 @@ if nav_page == "Measures":
 if nav_page == "Calculated Columns":
     with tab_guard('Calculated Columns'):
         st.subheader("Calculated columns")
+        st.caption(
+            "Columns computed by a row-context DAX expression instead of loaded from the "
+            "source, stored on disk like any other column. Worth a second look if there are "
+            "many of these — **Audit ➜ Model Health** flags ones that look cheap enough to move "
+            "upstream into Power Query/SQL instead, which computes them once at refresh instead "
+            "of storing a value per row."
+        )
         cols_df = model["calc_columns"]
         if cols_df.empty:
             st.info("No calculated columns found in this model.")
         else:
-            enriched = add_optimized_dax(cols_df, "ColumnExpression", model["measure_names"], model["column_tables"])
-            show_table(enriched.reset_index(drop=True), "Calculated Columns", height=460, key="calccols", row_height=130)
+            render_ai_dax_assistant(
+                "calculated column", cols_df, "ColumnName", "ColumnExpression", model, key_prefix="ai_calc"
+            )
+            show_table(cols_df.reset_index(drop=True), "Calculated Columns", height=460, key="calccols", row_height=130)
 
 # --- Relationships --------------------------------------------------------
 if nav_page == "Relationships":
     with tab_guard('Relationships'):
         st.subheader("Relationships")
+        st.caption(
+            "Every join the model defines, with cardinality and filter direction. **Bi-"
+            "directional** relationships are worth a second look — see **Audit ➜ Model Health** "
+            "for why. **Inactive** relationships exist but don't filter unless a measure "
+            "explicitly activates them with USERELATIONSHIP()."
+        )
         rel_df = model["relationships"]
         if rel_df.empty:
             st.info("No relationships found in this model.")
@@ -6298,7 +6400,10 @@ if nav_page == "Impact Analysis":
             "on more than one table (e.g. a join key shared by a fact and a dimension) — that's "
             "why you pick the table first."
         )
-        target_kind = st.radio("Look up a", ["Table", "Column"], horizontal=True, key="impact_kind")
+        target_kind = st.segmented_control(
+            "Look up a", ["Table", "Column"], key="impact_kind", required=True,
+            default="Table" if "impact_kind" not in st.session_state else None,
+        )
 
         result = None
         label = ""
@@ -6365,7 +6470,7 @@ if nav_page == "Measure Dependencies":
             show_table(dep_table, "Measure Dependencies", height=460, key="measure_deps", row_height=90)
 
             if any(graph.values()):
-                with st.expander("Show as a diagram"):
+                with st.expander("Show as a diagram", icon=":material/hub:"):
                     participating = sorted(
                         {n for n, calls in graph.items() if calls} | {c for calls in graph.values() for c in calls}
                     )
@@ -6385,7 +6490,8 @@ if nav_page == "Model Health":
             "(can never evaluate), duplicate measure names, or a relationship key with millions "
             "of distinct values.\n"
             "- **Medium** — a design choice worth double-checking, not necessarily wrong: "
-            "bi-directional relationships can cause ambiguous or double-counted results.\n"
+            "bi-directional or many-to-many relationships can cause ambiguous, double-counted, "
+            "or slow results.\n"
             "- **Low** — hygiene/documentation gaps that don't affect correctness: missing "
             "descriptions, inconsistent format strings, or a calculated column that might be "
             "cheaper to compute upstream in Power Query."
@@ -6451,6 +6557,13 @@ if nav_page == "Date Table Check":
 if nav_page == "Security & Perspectives":
     with tab_guard('Security & Perspectives'):
         st.subheader("Row-level security roles & perspectives")
+        st.caption(
+            "The raw role/perspective definitions from the model, as declared — not whether "
+            "they actually work. A role's filter expression only *looks* correct here; "
+            "**Govern ➜ RLS Simulator** traces whether it actually reaches the tables it's "
+            "meant to secure. Perspectives are curated subsets of the model shown to specific "
+            "tools/audiences — they don't restrict data access."
+        )
         sub = st.tabs(["Roles (RLS)", "Perspectives"])
         with sub[0]:
             roles_df = model["roles"]
@@ -6649,7 +6762,7 @@ if nav_page == "Compression Advisor":
             c2.metric("🟠 Medium", counts.get("Medium", 0))
             c3.metric("Columns advised", len(encoding_df))
             show_table(encoding_df, "Compression Advice", height=440, key="encoding", row_height=130)
-            with st.expander("How to act on these"):
+            with st.expander("How to act on these", icon=":material/build:"):
                 st.markdown(
                     "- **HASH on a numeric column** — set `EncodingHint = Value` in Tabular "
                     "Editor, or fix the source so the column is a clean integer. Removes the "
@@ -6807,7 +6920,7 @@ if nav_page == "RLS Simulator":
                 )
             else:
                 show_table(sort_by_severity(view), f"RLS {picked_role}", height=380, key="rls_trace", row_height=120)
-            with st.expander("How to fix a trapped filter"):
+            with st.expander("How to fix a trapped filter", icon=":material/build:"):
                 st.markdown(
                     "In order of preference:\n\n"
                     "1. **Secure the dimension, not the fact.** Put the filter on the table "
@@ -7045,7 +7158,7 @@ if nav_page == "Source Lineage":
             st.markdown("#### Source ➜ model mapping")
             show_table(lineage, "Source Lineage", height=320, key="lineage")
 
-            with st.expander("Show as a diagram", expanded=False):
+            with st.expander("Show as a diagram", expanded=False, icon=":material/hub:"):
                 static_diagram_panel(build_lineage_dot(lineage), engine="dot", filename="source_lineage")
 
 # --- Model Cleanup ------------------------------------------------------------
@@ -7108,9 +7221,10 @@ if nav_page == "Model Cleanup":
                             "Cleanup Columns", height=260, key="cleanup_cols",
                         )
 
-                fmt = st.radio(
+                fmt = st.segmented_control(
                     "Output format", ["Tabular Editor C#", "TMDL notes", "Cleaned Model.bim"],
-                    horizontal=True, key="cleanup_fmt",
+                    key="cleanup_fmt", required=True,
+                    default="Tabular Editor C#" if "cleanup_fmt" not in st.session_state else None,
                     help="C# runs the deletions directly. TMDL notes tell you which blocks to "
                          "remove from a source-controlled definition. Model.bim is the "
                          "rewritten definition itself.",
@@ -7192,7 +7306,7 @@ if nav_page == "Databricks Lakeview Export":
         )
         schema = c2.text_input("Schema", value=default_schema, key="lv_schema")
 
-        with st.expander("Table name mapping", expanded=False):
+        with st.expander("Table name mapping", expanded=False, icon=":material/swap_horiz:"):
             st.caption(
                 "Every model table becomes one Lakeview dataset, sourced from "
                 "`catalog.schema.<name below>`. Edit any row where the Databricks table "
@@ -7241,7 +7355,7 @@ if nav_page == "Databricks Lakeview Export":
                          "only (Power BI Desktop's 'Power BI project' file format).",
                 )
 
-        if st.button("⚙️ Generate Lakeview JSON", key="lv_generate", width="stretch"):
+        if st.button("Generate Lakeview JSON", key="lv_generate", width="stretch", icon=":material/settings:"):
             with st.spinner("Translating measures, relationships, and pages…"):
                 dashboard, conv_report = build_lakeview_dashboard(
                     model, catalog.strip() or "workspace", schema.strip() or "default",
@@ -7286,7 +7400,7 @@ if nav_page == "Databricks Lakeview Export":
                 show_table(conv_report, "Lakeview Conversion Report", height=360, key="lv_report_table")
 
             payload = json.dumps(dashboard, indent=2).encode("utf-8")
-            with st.expander("Preview generated JSON", expanded=False):
+            with st.expander("Preview generated JSON", expanded=False, icon=":material/data_object:"):
                 st.code(json.dumps(dashboard, indent=2)[:20000], language="json")
                 if len(payload) > 20000:
                     st.caption(f"Preview truncated — full file is {len(payload) / 1024:.0f} KB.")
