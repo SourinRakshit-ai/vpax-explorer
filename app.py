@@ -5208,68 +5208,156 @@ def regenerate_dax_with_llm(
     }
 
 
+def _regenerate_one(object_kind: str, table: str, name: str, expr: str, model: Dict[str, Any]) -> Dict[str, Any]:
+    """regenerate_dax_with_llm, but never raises - errors are folded into the
+    result shape so a batch run can keep going past one bad call."""
+    try:
+        result = regenerate_dax_with_llm(object_kind, table, name, expr, model)
+        return {**result, "error": None}
+    except LLMError as exc:
+        return {"revised_dax": "", "notes": "", "model_suggestions": "", "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"revised_dax": "", "notes": "", "model_suggestions": "", "error": f"Unexpected error: {exc}"}
+
+
 def render_ai_dax_assistant(
     object_kind: str, df: pd.DataFrame, name_col: str, expr_col: str, model: Dict[str, Any], key_prefix: str
-) -> None:
-    """Per-object 'Regenerate DAX' panel, shared by the Measures and
-    Calculated Columns pages. Reads its provider/key/model from the sidebar's
-    AI assistant section - set once there, used everywhere."""
-    with st.expander(f"AI DAX Assistant — regenerate a {object_kind}'s DAX with your configured LLM",
+) -> pd.DataFrame:
+    """AI DAX panel shared by the Measures and Calculated Columns pages -
+    either regenerate one object with a full before/after view, or regenerate
+    every object and get the result back as extra columns.
+
+    Reads its provider/key/model from the sidebar's AI assistant section -
+    set once there, used everywhere. Returns `df` with AI columns merged in
+    when a batch run has produced results, so the caller can hand that
+    straight to show_table (and therefore its CSV/Excel export) instead of
+    the original frame.
+    """
+    batch_key = f"{key_prefix}_batch_results"
+    with st.expander(f"AI DAX Assistant — regenerate {object_kind} DAX with your configured LLM",
                       icon=":material/smart_toy:", expanded=True):
         st.caption(
-            f"Sends the selected {object_kind}'s DAX, plus a compact summary of this model's "
-            "tables, columns and relationships, to the provider configured in the sidebar, and "
-            "asks it to rewrite the DAX following best practice and suggest any data-modelling "
-            "changes worth considering. **Nothing is applied automatically** — this app has no "
-            "way to write back into a .vpax, so review the result and copy it into Tabular "
-            "Editor or Power BI Desktop yourself."
+            f"Sends each {object_kind}'s DAX, plus a compact summary of this model's tables, "
+            "columns and relationships, to the provider configured in the sidebar, and asks it "
+            "to rewrite the DAX following best practice and suggest any data-modelling changes "
+            "worth considering. **Nothing is applied automatically** — this app has no way to "
+            "write back into a .vpax, so review the result and copy it into Tabular Editor or "
+            "Power BI Desktop yourself."
         )
         if not _llm_ready():
             st.info(
                 "Set an OpenAI or Claude API key in the sidebar's **AI assistant** section to "
                 "use this.", icon=":material/key:",
             )
-            return
+            return df
 
         options = df[name_col].dropna().astype(str).tolist()
         if not options:
             st.info(f"No {object_kind}s to regenerate.")
-            return
-        picked = st.selectbox(f"Choose a {object_kind}", options, key=f"{key_prefix}_pick")
-        row = df[df[name_col].astype(str) == picked].iloc[0]
-        table = str(row.get("TableName") or "")
-        expr = str(row.get(expr_col) or "")
-        # Included in the cache key so a picked object whose DAX changed
-        # (e.g. after re-uploading a different .vpax) doesn't show a stale
-        # suggestion generated against the old expression.
-        cache_key = f"{key_prefix}_result_{picked}_{hash(expr) & 0xffffffff}"
+            return df
 
         provider = st.session_state.get("llm_provider") or next(iter(LLM_PROVIDERS))
-        if st.button("✨ Regenerate with AI", key=f"{key_prefix}_go", width="stretch"):
-            with st.spinner(f"Asking {provider} to review {picked}…"):
-                try:
-                    result = regenerate_dax_with_llm(object_kind, table, picked, expr, model)
-                    st.session_state[cache_key] = result
-                except LLMError as exc:
-                    st.error(str(exc))
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"Unexpected error calling {provider}: {exc}")
+        tab_all, tab_one = st.tabs([f"Regenerate all ({len(options)})", "Regenerate one"])
 
-        result = st.session_state.get(cache_key)
-        if result:
-            d1, d2 = st.columns(2)
-            with d1:
-                st.markdown("**Current**")
-                st.code(expr or "(empty)", language="dax")
-            with d2:
-                st.markdown("**AI-suggested**")
-                st.code(result["revised_dax"] or "(no change suggested)", language="dax")
-            if result["notes"]:
-                st.markdown("**Notes**")
-                st.write(result["notes"])
-            if result["model_suggestions"]:
-                st.markdown("**Model-change suggestions**")
-                st.info(result["model_suggestions"], icon=":material/lightbulb:")
+        with tab_all:
+            st.caption(
+                f"One API call per {object_kind} — **{len(options)} calls total**. This can take "
+                "several minutes and uses real API quota on your key. Progress is saved as it "
+                "goes, so it's safe to stop partway and resume later; already-done objects are "
+                "skipped on the next run."
+            )
+            results: Dict[str, Dict[str, Any]] = st.session_state.get(batch_key, {})
+            done, total = len(results), len(options)
+            n_err = sum(1 for r in results.values() if r.get("error"))
+            m1, m2 = st.columns(2)
+            m1.metric("Processed", f"{done} / {total}")
+            m2.metric("Errors", n_err)
+
+            confirm = st.checkbox(
+                f"I understand this makes {total - done} API call(s) to {provider}",
+                key=f"{key_prefix}_batch_confirm", value=False,
+            ) if done < total else True
+
+            c1, c2 = st.columns([3, 1])
+            go_label = f"✨ Regenerate all {total} with AI" if done == 0 else f"✨ Regenerate remaining {total - done}"
+            go = c1.button(
+                go_label, key=f"{key_prefix}_batch_go", width="stretch",
+                disabled=(done >= total) or not confirm,
+            )
+            if results and c2.button("Clear", key=f"{key_prefix}_batch_clear", width="stretch"):
+                st.session_state[batch_key] = {}
+                st.rerun()
+
+            if go:
+                remaining = [o for o in options if o not in results]
+                progress = st.progress(0.0)
+                status = st.empty()
+                for i, name in enumerate(remaining):
+                    status.caption(f"Asking {provider} to review “{name}”… ({i + 1}/{len(remaining)})")
+                    row = df[df[name_col].astype(str) == name].iloc[0]
+                    table = str(row.get("TableName") or "")
+                    expr = str(row.get(expr_col) or "")
+                    results[name] = _regenerate_one(object_kind, table, name, expr, model)
+                    st.session_state[batch_key] = dict(results)
+                    progress.progress((i + 1) / max(len(remaining), 1))
+                status.empty()
+                progress.empty()
+                st.rerun()
+
+        with tab_one:
+            picked = st.selectbox(f"Choose a {object_kind}", options, key=f"{key_prefix}_pick")
+            row = df[df[name_col].astype(str) == picked].iloc[0]
+            table = str(row.get("TableName") or "")
+            expr = str(row.get(expr_col) or "")
+            # Included in the cache key so a picked object whose DAX changed
+            # (e.g. after re-uploading a different .vpax) doesn't show a
+            # stale suggestion generated against the old expression.
+            cache_key = f"{key_prefix}_result_{picked}_{hash(expr) & 0xffffffff}"
+
+            if st.button("✨ Regenerate with AI", key=f"{key_prefix}_go", width="stretch"):
+                with st.spinner(f"Asking {provider} to review {picked}…"):
+                    result = _regenerate_one(object_kind, table, picked, expr, model)
+                    if result["error"]:
+                        st.error(result["error"])
+                    else:
+                        st.session_state[cache_key] = result
+
+            result = st.session_state.get(cache_key)
+            if result:
+                d1, d2 = st.columns(2)
+                with d1:
+                    st.markdown("**Current**")
+                    st.code(expr or "(empty)", language="dax")
+                with d2:
+                    st.markdown("**AI-suggested**")
+                    st.code(result["revised_dax"] or "(no change suggested)", language="dax")
+                if result["notes"]:
+                    st.markdown("**Notes**")
+                    st.write(result["notes"])
+                if result["model_suggestions"]:
+                    st.markdown("**Model-change suggestions**")
+                    st.info(result["model_suggestions"], icon=":material/lightbulb:")
+
+    batch_results = st.session_state.get(batch_key, {})
+    if not batch_results:
+        return df
+
+    def _cell(name: str, key: str) -> str:
+        r = batch_results.get(name)
+        if r is None:
+            return ""
+        if r.get("error"):
+            return f"ERROR: {r['error']}" if key == "revised_dax" else ""
+        if key == "revised_dax":
+            return r["revised_dax"] or "(no change suggested)"
+        return r.get(key) or ""
+
+    out = df.copy()
+    names = out[name_col].astype(str)
+    out["AI-Suggested DAX"] = names.map(lambda n: _cell(n, "revised_dax"))
+    out["AI Notes"] = names.map(lambda n: _cell(n, "notes"))
+    out["AI Model Suggestions"] = names.map(lambda n: _cell(n, "model_suggestions"))
+    return out
 
 
 # ==========================================================================
@@ -6213,17 +6301,18 @@ if nav_page == "Measures":
         else:
             st.caption(
                 "Every measure's DAX, as stored in the model. Use the AI DAX Assistant above to "
-                "get a best-practice rewrite and modelling suggestions for one measure at a time."
+                "get a best-practice rewrite and modelling suggestions — for one measure, or for "
+                "all of them at once as extra, downloadable columns on the table below."
             )
-            render_ai_dax_assistant(
+            meas_view_df = render_ai_dax_assistant(
                 "measure", meas_df, "MeasureName", "MeasureExpression", model, key_prefix="ai_meas"
             )
             search = st.text_input("Search measure name or expression…", key="measure_search")
-            view = meas_df
+            view = meas_view_df
             if search:
-                view = meas_df[
-                    meas_df["MeasureName"].str.contains(search, case=False, na=False)
-                    | meas_df["MeasureExpression"].str.contains(search, case=False, na=False)
+                view = meas_view_df[
+                    meas_view_df["MeasureName"].str.contains(search, case=False, na=False)
+                    | meas_view_df["MeasureExpression"].str.contains(search, case=False, na=False)
                 ]
             show_table(view.reset_index(drop=True), "Measures", height=460, key="measures", row_height=130)
 
@@ -6242,10 +6331,10 @@ if nav_page == "Calculated Columns":
         if cols_df.empty:
             st.info("No calculated columns found in this model.")
         else:
-            render_ai_dax_assistant(
+            cols_view_df = render_ai_dax_assistant(
                 "calculated column", cols_df, "ColumnName", "ColumnExpression", model, key_prefix="ai_calc"
             )
-            show_table(cols_df.reset_index(drop=True), "Calculated Columns", height=460, key="calccols", row_height=130)
+            show_table(cols_view_df.reset_index(drop=True), "Calculated Columns", height=460, key="calccols", row_height=130)
 
 # --- Relationships --------------------------------------------------------
 if nav_page == "Relationships":
