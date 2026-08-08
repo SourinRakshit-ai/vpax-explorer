@@ -5174,33 +5174,35 @@ def call_llm(prompt: str) -> str:
     return call_anthropic(api_key, model_id, prompt)
 
 
-def regenerate_dax_with_llm(
-    object_kind: str, table: str, name: str, expression: str, model: Dict[str, Any],
-) -> Dict[str, str]:
-    """Call the configured LLM and parse its JSON reply.
+def _parse_llm_json(raw: str) -> Dict[str, Any]:
+    """Parse an LLM reply that's supposed to be one JSON object.
 
     Includes a defensive fallback for when the model wraps its JSON in a
     markdown code fence or adds stray commentary around it - common enough
     behaviour, even when explicitly asked for JSON only, that silently
-    failing on it would make this feature unreliable.
+    failing on it would make every JSON-shaped AI feature unreliable.
     """
-    prompt = build_dax_regeneration_prompt(object_kind, table, name, expression, model)
-    raw = call_llm(prompt)
-
     text = raw.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I).strip()
     try:
-        parsed = json.loads(text)
+        return json.loads(text)
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", text, flags=re.S)
         if not match:
             raise LLMError(f"The model didn't return parseable JSON. Raw reply:\n\n{raw[:2000]}")
         try:
-            parsed = json.loads(match.group(0))
+            return json.loads(match.group(0))
         except json.JSONDecodeError as exc:
             raise LLMError(f"The model's JSON couldn't be parsed. Raw reply:\n\n{raw[:2000]}") from exc
 
+
+def regenerate_dax_with_llm(
+    object_kind: str, table: str, name: str, expression: str, model: Dict[str, Any],
+) -> Dict[str, str]:
+    """Call the configured LLM and parse its JSON reply."""
+    prompt = build_dax_regeneration_prompt(object_kind, table, name, expression, model)
+    parsed = _parse_llm_json(call_llm(prompt))
     return {
         "revised_dax": str(parsed.get("revised_dax") or "").strip(),
         "notes": str(parsed.get("notes") or "").strip(),
@@ -5218,6 +5220,718 @@ def _regenerate_one(object_kind: str, table: str, name: str, expr: str, model: D
         return {"revised_dax": "", "notes": "", "model_suggestions": "", "error": str(exc)}
     except Exception as exc:  # noqa: BLE001
         return {"revised_dax": "", "notes": "", "model_suggestions": "", "error": f"Unexpected error: {exc}"}
+
+
+def build_grouped_fix_prompt(
+    group: str, findings: pd.DataFrame, model: Dict[str, Any], object_col: str, message_col: str,
+) -> str:
+    """One group's worth of findings at a time, not one call per finding -
+    findings sharing a group (a rule, a check, a table...) usually share a
+    root cause, so batching by group keeps the call count proportional to
+    distinct problem types instead of the total finding count (which can be
+    hundreds on a real model)."""
+    schema = _compact_schema_summary(model, max_tables=20, max_cols_per_table=8)
+    capped = findings.head(30)
+    rows = "\n".join(
+        f"- Object: {r[object_col]}"
+        + (f" | Severity: {r['Severity']}" if "Severity" in findings.columns else "")
+        + f" | Detail: {r[message_col]}"
+        for _, r in capped.iterrows()
+    )
+    extra = f"\n… +{len(findings) - len(capped)} more object(s) in this same group (same fix pattern likely applies)" \
+        if len(findings) > len(capped) else ""
+
+    return f"""You are a senior Power BI / DAX consultant writing specific, actionable remediation guidance
+for a batch of automated findings that all share one group.
+
+Group: {group}
+
+Findings in this group:
+{rows}{extra}
+
+Model schema (abbreviated, for context only):
+{schema}
+
+For EACH object listed above, write a specific fix tailored to that exact object - reference its
+real name, not generic advice like "review this column". If several objects share an identical
+mechanical fix, it's fine for the wording to be similar, but still address every object listed by
+name.
+
+Respond with ONLY a single JSON object (no markdown fences, no commentary outside the JSON):
+{{
+  "fixes": {{"<exact Object value from above>": "specific fix for this object", ...}},
+  "summary": "one or two sentences on the overall pattern and priority for this group"
+}}
+Never invent an object that isn't listed above."""
+
+
+def get_ai_grouped_fixes(
+    group: str, findings: pd.DataFrame, model: Dict[str, Any], object_col: str, message_col: str,
+) -> Dict[str, Any]:
+    prompt = build_grouped_fix_prompt(group, findings, model, object_col, message_col)
+    parsed = _parse_llm_json(call_llm(prompt))
+    fixes = parsed.get("fixes")
+    return {
+        "fixes": fixes if isinstance(fixes, dict) else {},
+        "summary": str(parsed.get("summary") or "").strip(),
+    }
+
+
+def render_ai_grouped_fixes(
+    findings_df: pd.DataFrame, model: Dict[str, Any], key_prefix: str,
+    group_col: str, object_col: str, message_col: str, group_label: str,
+    out_col: str = "AI How to Fix",
+) -> pd.DataFrame:
+    """AI-enhanced fix guidance for any findings table with a groupable
+    category column (Model Health's Rule, Fabric Readiness's Check,
+    Compression Advisor's Table...) - one LLM call per distinct group, not
+    per finding, so it stays cheap even when there are hundreds of findings.
+    Returns findings_df with `out_col` merged in once a batch has run, for
+    the caller to hand to show_table.
+    """
+    batch_key = f"{key_prefix}_batch_results"
+    with st.expander(f"AI-enhanced fix guidance — specific advice per finding, grouped by {group_label}",
+                      icon=":material/smart_toy:", expanded=False):
+        st.caption(
+            "The fix guidance above is the same general text for every finding in a group. This "
+            "sends each group's actual findings (the real object names and details) to the "
+            f"provider configured in the sidebar and asks for advice specific to those exact "
+            f"objects — one call per {group_label}, not per finding."
+        )
+        if not _llm_ready():
+            st.info(
+                "Set an OpenAI or Claude API key in the sidebar's **AI assistant** section to "
+                "use this.", icon=":material/key:",
+            )
+            return findings_df
+        if group_col not in findings_df.columns or findings_df.empty:
+            st.info("No findings to explain.")
+            return findings_df
+
+        groups = sorted(findings_df[group_col].dropna().unique().tolist())
+        cache: Dict[str, Any] = st.session_state.get(batch_key, {})
+        done, total = len(cache), len(groups)
+        provider = st.session_state.get("llm_provider") or next(iter(LLM_PROVIDERS))
+
+        m1, m2 = st.columns(2)
+        m1.metric(f"{group_label.capitalize()}s processed", f"{done} / {total}")
+        m2.metric("Errors", sum(1 for r in cache.values() if r.get("error")))
+
+        confirm = st.checkbox(
+            f"I understand this makes {total - done} API call(s) to {provider}",
+            key=f"{key_prefix}_confirm", value=False,
+        ) if done < total else True
+
+        c1, c2 = st.columns([3, 1])
+        go_label = f"✨ Get AI fixes for all {total} {group_label}s" if done == 0 else f"✨ Get fixes for remaining {total - done}"
+        go = c1.button(go_label, key=f"{key_prefix}_go", width="stretch", disabled=(done >= total) or not confirm)
+        if cache and c2.button("Clear", key=f"{key_prefix}_clear", width="stretch"):
+            st.session_state[batch_key] = {}
+            st.rerun()
+
+        if go:
+            remaining = [g for g in groups if g not in cache]
+            progress = st.progress(0.0)
+            status = st.empty()
+            for i, g in enumerate(remaining):
+                status.caption(f"Asking {provider} about “{g}”… ({i + 1}/{len(remaining)})")
+                group_findings = findings_df[findings_df[group_col] == g]
+                try:
+                    cache[g] = {**get_ai_grouped_fixes(str(g), group_findings, model, object_col, message_col), "error": None}
+                except LLMError as exc:
+                    cache[g] = {"fixes": {}, "summary": "", "error": str(exc)}
+                except Exception as exc:  # noqa: BLE001
+                    cache[g] = {"fixes": {}, "summary": "", "error": f"Unexpected error: {exc}"}
+                st.session_state[batch_key] = dict(cache)
+                progress.progress((i + 1) / max(len(remaining), 1))
+            status.empty()
+            progress.empty()
+            st.rerun()
+
+        for g, result in cache.items():
+            if result.get("error"):
+                st.error(f"**{g}**: {result['error']}")
+            elif result.get("summary"):
+                st.markdown(f"**{g}**")
+                st.write(result["summary"])
+
+    if not cache:
+        return findings_df
+
+    def _fix_for(row: pd.Series) -> str:
+        r = cache.get(row[group_col])
+        if not r or r.get("error"):
+            return ""
+        return r.get("fixes", {}).get(str(row[object_col]), "")
+
+    out = findings_df.copy()
+    out[out_col] = out.apply(_fix_for, axis=1)
+    return out
+
+
+def build_duplicate_judgment_prompt(row: pd.Series, model: Dict[str, Any]) -> str:
+    schema = _compact_schema_summary(model, max_tables=15, max_cols_per_table=6)
+    return f"""You are a senior Power BI / DAX consultant helping consolidate a pair of near-duplicate measures.
+
+Measure A: {row['Measure A']} (table: {row['Table A']})
+{row['DAX A']}
+
+Measure B: {row['Measure B']} (table: {row['Table B']})
+{row['DAX B']}
+
+Similarity: {row['Similarity %']}%
+
+Model schema (abbreviated, for context only):
+{schema}
+
+Decide which measure should be KEPT as the single source of truth, and which should be retired and
+repointed to it. Consider which table is the more natural home, which name is clearer, whether one
+is a strict subset/superset of the other's logic, and whether the DAX difference looks like a
+genuine intentional business rule or accidental copy-paste drift that should be fixed, not kept.
+
+Respond with ONLY a single JSON object (no markdown fences, no commentary outside the JSON):
+{{
+  "keep": "A" or "B",
+  "reasoning": "one or two sentences, referencing the actual DAX difference if there is one",
+  "is_intentional_difference": true or false
+}}"""
+
+
+def get_duplicate_judgment(row: pd.Series, model: Dict[str, Any]) -> Dict[str, Any]:
+    prompt = build_duplicate_judgment_prompt(row, model)
+    parsed = _parse_llm_json(call_llm(prompt))
+    keep = str(parsed.get("keep") or "").strip().upper()
+    return {
+        "keep": keep if keep in ("A", "B") else "",
+        "reasoning": str(parsed.get("reasoning") or "").strip(),
+        "is_intentional": bool(parsed.get("is_intentional_difference")),
+    }
+
+
+def render_ai_duplicate_judgments(dupes_df: pd.DataFrame, model: Dict[str, Any], key_prefix: str) -> pd.DataFrame:
+    """One LLM call per near-duplicate pair - unlike the grouped-fix helper,
+    every pair is genuinely distinct (different DAX, different context), so
+    there's no shared root cause to batch by."""
+    batch_key = f"{key_prefix}_batch_results"
+    with st.expander("AI consolidation advice — which measure to keep, per pair",
+                      icon=":material/smart_toy:", expanded=False):
+        st.caption(
+            "For each pair, sends both DAX expressions to the provider configured in the "
+            "sidebar and asks which one to keep as the single source of truth, and whether the "
+            "difference looks like a genuine business rule or accidental drift."
+        )
+        if not _llm_ready():
+            st.info(
+                "Set an OpenAI or Claude API key in the sidebar's **AI assistant** section to "
+                "use this.", icon=":material/key:",
+            )
+            return dupes_df
+        if dupes_df.empty:
+            return dupes_df
+
+        pairs = dupes_df.apply(lambda r: f"{r['Measure A']} ||| {r['Measure B']}", axis=1).tolist()
+        cache: Dict[str, Any] = st.session_state.get(batch_key, {})
+        done, total = len(cache), len(pairs)
+        provider = st.session_state.get("llm_provider") or next(iter(LLM_PROVIDERS))
+
+        m1, m2 = st.columns(2)
+        m1.metric("Pairs judged", f"{done} / {total}")
+        m2.metric("Errors", sum(1 for r in cache.values() if r.get("error")))
+
+        confirm = st.checkbox(
+            f"I understand this makes {total - done} API call(s) to {provider}",
+            key=f"{key_prefix}_confirm", value=False,
+        ) if done < total else True
+        c1, c2 = st.columns([3, 1])
+        go_label = f"✨ Judge all {total} pairs" if done == 0 else f"✨ Judge remaining {total - done}"
+        go = c1.button(go_label, key=f"{key_prefix}_go", width="stretch", disabled=(done >= total) or not confirm)
+        if cache and c2.button("Clear", key=f"{key_prefix}_clear", width="stretch"):
+            st.session_state[batch_key] = {}
+            st.rerun()
+
+        if go:
+            remaining_idx = [i for i, k in enumerate(pairs) if k not in cache]
+            progress = st.progress(0.0)
+            status = st.empty()
+            for n, i in enumerate(remaining_idx):
+                row = dupes_df.iloc[i]
+                k = pairs[i]
+                status.caption(
+                    f"Asking {provider} about “{row['Measure A']}” vs “{row['Measure B']}”… "
+                    f"({n + 1}/{len(remaining_idx)})"
+                )
+                try:
+                    cache[k] = {**get_duplicate_judgment(row, model), "error": None}
+                except LLMError as exc:
+                    cache[k] = {"keep": "", "reasoning": "", "is_intentional": False, "error": str(exc)}
+                except Exception as exc:  # noqa: BLE001
+                    cache[k] = {"keep": "", "reasoning": "", "is_intentional": False, "error": f"Unexpected error: {exc}"}
+                st.session_state[batch_key] = dict(cache)
+                progress.progress((n + 1) / max(len(remaining_idx), 1))
+            status.empty()
+            progress.empty()
+            st.rerun()
+
+    if not cache:
+        return dupes_df
+
+    out = dupes_df.copy()
+
+    def _recommend(row: pd.Series) -> str:
+        k = f"{row['Measure A']} ||| {row['Measure B']}"
+        r = cache.get(k)
+        if not r or r.get("error"):
+            return ""
+        if r["keep"] == "A":
+            return f"Keep {row['Measure A']} ({row['Table A']})"
+        if r["keep"] == "B":
+            return f"Keep {row['Measure B']} ({row['Table B']})"
+        return ""
+
+    def _reasoning(row: pd.Series) -> str:
+        k = f"{row['Measure A']} ||| {row['Measure B']}"
+        r = cache.get(k)
+        if not r or r.get("error"):
+            return ""
+        tag = "" if r.get("is_intentional") else " (looks accidental)"
+        return f"{r['reasoning']}{tag}"
+
+    out["AI Recommendation"] = out.apply(_recommend, axis=1)
+    out["AI Reasoning"] = out.apply(_reasoning, axis=1)
+    return out
+
+
+def build_unused_risk_prompt(table: str, cols: pd.DataFrame, model: Dict[str, Any]) -> str:
+    schema = _compact_schema_summary(model, max_tables=20, max_cols_per_table=8)
+    capped = cols.head(30)
+    names = "\n".join(f"- {r['Column']}" for _, r in capped.iterrows())
+    extra = f"\n… +{len(cols) - len(capped)} more column(s) on this table" if len(cols) > len(capped) else ""
+
+    return f"""You are a senior Power BI consultant reviewing columns a static DAX-reference scan found no
+measure, calculated column, or relationship pointing at — candidates for deletion, but the scan
+cannot see Power BI report visuals or row-level-security filter expressions, so some of these may
+still be in active use.
+
+Table: {table}
+
+Columns flagged as likely unused on this table:
+{names}{extra}
+
+Model schema (abbreviated, for context only):
+{schema}
+
+For EACH column listed above, give a confidence judgment based only on its name and the schema
+context — not invented facts. Use "Likely safe" for columns whose name suggests nothing else would
+plausibly need them (internal keys, deprecated-looking names, clear duplicates of another column).
+Use "Verify first" for columns whose name suggests a real risk a DAX-only scan can't see — anything
+that looks like it could be a report-visual axis/slicer field, an RLS/security-related column, a
+display or tooltip label, or a natural key someone might filter on directly.
+
+Respond with ONLY a single JSON object (no markdown fences, no commentary outside the JSON):
+{{
+  "assessments": {{"<exact column name from above>": {{"confidence": "Likely safe" or "Verify first", "reason": "one short sentence"}}, ...}}
+}}
+Never invent a column that isn't listed above."""
+
+
+def get_ai_unused_risk(table: str, cols: pd.DataFrame, model: Dict[str, Any]) -> Dict[str, Any]:
+    prompt = build_unused_risk_prompt(table, cols, model)
+    parsed = _parse_llm_json(call_llm(prompt))
+    assessments = parsed.get("assessments")
+    return {"assessments": assessments if isinstance(assessments, dict) else {}}
+
+
+def render_ai_unused_risk(unused_view: pd.DataFrame, model: Dict[str, Any], key_prefix: str) -> pd.DataFrame:
+    """AI confidence judgment on the 'likely unused' list, grouped by table
+    (one call per table, not per column - this model's real list ran to 400+
+    columns, so per-column would be prohibitively expensive)."""
+    batch_key = f"{key_prefix}_batch_results"
+    with st.expander("AI risk assessment — which of these are actually safe to delete",
+                      icon=":material/smart_toy:", expanded=False):
+        st.caption(
+            "This scan is DAX-only — it can't see report visuals or RLS filters, so 'likely "
+            "unused' isn't a guarantee. This sends each table's flagged columns to the provider "
+            "configured in the sidebar and asks it to flag which look genuinely safe to drop "
+            "versus which are worth double-checking first, based on naming patterns alone."
+        )
+        if not _llm_ready():
+            st.info(
+                "Set an OpenAI or Claude API key in the sidebar's **AI assistant** section to "
+                "use this.", icon=":material/key:",
+            )
+            return unused_view
+        if unused_view.empty:
+            return unused_view
+
+        tables = sorted(unused_view["Table"].dropna().unique().tolist())
+        cache: Dict[str, Any] = st.session_state.get(batch_key, {})
+        done, total = len(cache), len(tables)
+        provider = st.session_state.get("llm_provider") or next(iter(LLM_PROVIDERS))
+
+        m1, m2 = st.columns(2)
+        m1.metric("Tables processed", f"{done} / {total}")
+        m2.metric("Errors", sum(1 for r in cache.values() if r.get("error")))
+
+        confirm = st.checkbox(
+            f"I understand this makes {total - done} API call(s) to {provider}",
+            key=f"{key_prefix}_confirm", value=False,
+        ) if done < total else True
+        c1, c2 = st.columns([3, 1])
+        go_label = f"✨ Assess all {total} tables" if done == 0 else f"✨ Assess remaining {total - done}"
+        go = c1.button(go_label, key=f"{key_prefix}_go", width="stretch", disabled=(done >= total) or not confirm)
+        if cache and c2.button("Clear", key=f"{key_prefix}_clear", width="stretch"):
+            st.session_state[batch_key] = {}
+            st.rerun()
+
+        if go:
+            remaining = [t for t in tables if t not in cache]
+            progress = st.progress(0.0)
+            status = st.empty()
+            for i, table in enumerate(remaining):
+                status.caption(f"Asking {provider} about “{table}”… ({i + 1}/{len(remaining)})")
+                table_cols = unused_view[unused_view["Table"] == table]
+                try:
+                    cache[table] = {**get_ai_unused_risk(table, table_cols, model), "error": None}
+                except LLMError as exc:
+                    cache[table] = {"assessments": {}, "error": str(exc)}
+                except Exception as exc:  # noqa: BLE001
+                    cache[table] = {"assessments": {}, "error": f"Unexpected error: {exc}"}
+                st.session_state[batch_key] = dict(cache)
+                progress.progress((i + 1) / max(len(remaining), 1))
+            status.empty()
+            progress.empty()
+            st.rerun()
+
+    if not cache:
+        return unused_view
+
+    def _confidence(row: pd.Series) -> str:
+        r = cache.get(row["Table"])
+        if not r or r.get("error"):
+            return ""
+        a = r.get("assessments", {}).get(str(row["Column"]))
+        return a.get("confidence", "") if isinstance(a, dict) else ""
+
+    def _reason(row: pd.Series) -> str:
+        r = cache.get(row["Table"])
+        if not r or r.get("error"):
+            return ""
+        a = r.get("assessments", {}).get(str(row["Column"]))
+        return a.get("reason", "") if isinstance(a, dict) else ""
+
+    out = unused_view.copy()
+    out["AI Confidence"] = out.apply(_confidence, axis=1)
+    out["AI Reason"] = out.apply(_reason, axis=1)
+    return out
+
+
+def build_description_draft_prompt(
+    table: str, measures: pd.DataFrame, cols: pd.DataFrame, model: Dict[str, Any],
+) -> str:
+    schema = _compact_schema_summary(model, max_tables=15, max_cols_per_table=6)
+    meas_lines = "\n".join(
+        f"- Measure: {r['MeasureName']} = {r['MeasureExpression']}" for _, r in measures.head(20).iterrows()
+    )
+    col_lines = "\n".join(
+        f"- Column: {r['ColumnName']} ({r.get('DataType', '')})" for _, r in cols.head(20).iterrows()
+    )
+    return f"""You are a senior BI analyst writing a data dictionary. Draft short, plain-English business
+descriptions for the undocumented objects below on table "{table}" - the kind a new analyst or a
+business stakeholder (not a DAX expert) would find useful. Base descriptions only on the object's
+name, its DAX (for measures), and the schema context - never invent business meaning that isn't
+evidenced by the name or logic.
+
+Measures with no description:
+{meas_lines or '(none)'}
+
+Columns with no description:
+{col_lines or '(none)'}
+
+Model schema (abbreviated, for context only):
+{schema}
+
+Respond with ONLY a single JSON object (no markdown fences, no commentary outside the JSON):
+{{
+  "measures": {{"<exact measure name from above>": "one-sentence description", ...}},
+  "columns": {{"<exact column name from above>": "one-sentence description", ...}}
+}}
+Only include objects listed above."""
+
+
+def get_ai_description_drafts(
+    table: str, measures: pd.DataFrame, cols: pd.DataFrame, model: Dict[str, Any],
+) -> Dict[str, Any]:
+    prompt = build_description_draft_prompt(table, measures, cols, model)
+    parsed = _parse_llm_json(call_llm(prompt))
+    return {
+        "measures": parsed.get("measures") if isinstance(parsed.get("measures"), dict) else {},
+        "columns": parsed.get("columns") if isinstance(parsed.get("columns"), dict) else {},
+    }
+
+
+def render_ai_descriptions(model: Dict[str, Any], key_prefix: str) -> pd.DataFrame:
+    """AI-drafted plain-English descriptions for measures/columns that have
+    none, grouped by table (one call per table with undocumented objects).
+    Returns a standalone {Table, Object Type, Object Name, AI-Drafted
+    Description} frame - a review sheet, not a write into the live model, so
+    nothing else in the app is affected by what the AI drafts here."""
+    meas_df = model["measures"]
+    cols_df = _user_facing_columns(model["columns"])
+    undoc_meas = meas_df[meas_df.get("Description", "").astype(str).str.strip() == ""] if "Description" in meas_df.columns else meas_df.iloc[0:0]
+    undoc_cols = cols_df[cols_df.get("Description", "").astype(str).str.strip() == ""] if "Description" in cols_df.columns else cols_df.iloc[0:0]
+
+    with st.expander("AI-drafted descriptions — for measures/columns with none",
+                      icon=":material/smart_toy:", expanded=False):
+        n_meas, n_cols = len(undoc_meas), len(undoc_cols)
+        st.caption(
+            f"{n_meas} measure(s) and {n_cols} column(s) in this model have no description. This "
+            "drafts plain-English descriptions from each object's name and DAX (for measures) — "
+            "review before publishing, since it can't know business context beyond what's "
+            "evidenced in the model itself. One call per table with undocumented objects."
+        )
+        if not _llm_ready():
+            st.info(
+                "Set an OpenAI or Claude API key in the sidebar's **AI assistant** section to "
+                "use this.", icon=":material/key:",
+            )
+            return pd.DataFrame(columns=["Table", "Object Type", "Object Name", "AI-Drafted Description"])
+        if n_meas == 0 and n_cols == 0:
+            st.success("Every measure and column already has a description.", icon="✅")
+            return pd.DataFrame(columns=["Table", "Object Type", "Object Name", "AI-Drafted Description"])
+
+        tables = sorted(set(undoc_meas["TableName"].dropna().tolist()) | set(undoc_cols["TableName"].dropna().tolist()))
+        batch_key = f"{key_prefix}_batch_results"
+        cache: Dict[str, Any] = st.session_state.get(batch_key, {})
+        done, total = len(cache), len(tables)
+        provider = st.session_state.get("llm_provider") or next(iter(LLM_PROVIDERS))
+
+        m1, m2 = st.columns(2)
+        m1.metric("Tables drafted", f"{done} / {total}")
+        m2.metric("Errors", sum(1 for r in cache.values() if r.get("error")))
+
+        confirm = st.checkbox(
+            f"I understand this makes {total - done} API call(s) to {provider}",
+            key=f"{key_prefix}_confirm", value=False,
+        ) if done < total else True
+        c1, c2 = st.columns([3, 1])
+        go_label = f"✨ Draft descriptions for all {total} tables" if done == 0 else f"✨ Draft remaining {total - done}"
+        go = c1.button(go_label, key=f"{key_prefix}_go", width="stretch", disabled=(done >= total) or not confirm)
+        if cache and c2.button("Clear", key=f"{key_prefix}_clear", width="stretch"):
+            st.session_state[batch_key] = {}
+            st.rerun()
+
+        if go:
+            remaining = [t for t in tables if t not in cache]
+            progress = st.progress(0.0)
+            status = st.empty()
+            for i, table in enumerate(remaining):
+                status.caption(f"Asking {provider} about “{table}”… ({i + 1}/{len(remaining)})")
+                t_meas = undoc_meas[undoc_meas["TableName"] == table]
+                t_cols = undoc_cols[undoc_cols["TableName"] == table]
+                try:
+                    cache[table] = {**get_ai_description_drafts(table, t_meas, t_cols, model), "error": None}
+                except LLMError as exc:
+                    cache[table] = {"measures": {}, "columns": {}, "error": str(exc)}
+                except Exception as exc:  # noqa: BLE001
+                    cache[table] = {"measures": {}, "columns": {}, "error": f"Unexpected error: {exc}"}
+                st.session_state[batch_key] = dict(cache)
+                progress.progress((i + 1) / max(len(remaining), 1))
+            status.empty()
+            progress.empty()
+            st.rerun()
+
+        if cache:
+            rows = []
+            for table, result in cache.items():
+                if result.get("error"):
+                    continue
+                for name, desc in result.get("measures", {}).items():
+                    rows.append({"Table": table, "Object Type": "Measure", "Object Name": name,
+                                 "AI-Drafted Description": desc})
+                for name, desc in result.get("columns", {}).items():
+                    rows.append({"Table": table, "Object Type": "Column", "Object Name": name,
+                                 "AI-Drafted Description": desc})
+            out = pd.DataFrame(rows, columns=["Table", "Object Type", "Object Name", "AI-Drafted Description"])
+            if not out.empty:
+                show_table(out, "AI-Drafted Descriptions", height=320, key=f"{key_prefix}_preview", row_height=90)
+            return out
+
+    return pd.DataFrame(columns=["Table", "Object Type", "Object Name", "AI-Drafted Description"])
+
+
+def _fmt_ai_context_rows(df: pd.DataFrame, cols: List[str], cap: int = 20) -> str:
+    """A bounded, plain-text row dump for an LLM prompt - shared by the
+    single-call 'narrative' AI features (changelog, likely-cause) that need
+    to show a table's content without the batch-by-group machinery."""
+    if df.empty:
+        return "(none)"
+    present = [c for c in cols if c in df.columns]
+    lines = [" | ".join(f"{c}: {r[c]}" for c in present) for _, r in df.head(cap).iterrows()]
+    extra = f"\n… +{len(df) - cap} more" if len(df) > cap else ""
+    return "- " + "\n- ".join(lines) + extra
+
+
+def build_compare_changelog_prompt(
+    drift: pd.DataFrame, added: pd.DataFrame, removed: pd.DataFrame, structure: pd.DataFrame,
+    b_name: str, model: Dict[str, Any],
+) -> str:
+    return f"""You are a senior Power BI consultant writing a plain-English changelog for a stakeholder who
+needs to know what changed between a certified baseline model and a newer version, and whether they
+should be worried.
+
+Baseline: {b_name}
+
+Drifted measures (same name, different DAX):
+{_fmt_ai_context_rows(drift, ["Measure", "Change", "Severity", "Baseline Table", "Compared Table"])}
+
+Measures missing from the newer model:
+{_fmt_ai_context_rows(removed, ["Measure", "Table", "Severity"])}
+
+Extra measures only in the newer model:
+{_fmt_ai_context_rows(added, ["Measure", "Table", "Severity"])}
+
+Structural differences:
+{_fmt_ai_context_rows(structure, list(structure.columns)[:5])}
+
+Write a short markdown summary with exactly these three headings:
+### What changed
+Plain-language summary, grouped by theme if there's a pattern — not a re-listing of every row.
+
+### Risk
+Which changes are most likely to break downstream reports or produce wrong numbers, and why.
+
+### Recommended next step
+One or two concrete actions.
+
+Be specific to what's actually listed above. Never invent a measure or change that isn't listed."""
+
+
+def render_ai_compare_changelog(
+    drift: pd.DataFrame, added: pd.DataFrame, removed: pd.DataFrame, structure: pd.DataFrame,
+    b_name: str, model: Dict[str, Any], key_prefix: str,
+) -> None:
+    """A single LLM call summarizing the whole diff - unlike the audit tabs,
+    there's one coherent story to tell here, not many independent findings
+    to batch through."""
+    with st.expander("AI changelog — what changed and why it matters",
+                      icon=":material/smart_toy:", expanded=True):
+        if not _llm_ready():
+            st.info(
+                "Set an OpenAI or Claude API key in the sidebar's **AI assistant** section to "
+                "use this.", icon=":material/key:",
+            )
+            return
+        provider = st.session_state.get("llm_provider") or next(iter(LLM_PROVIDERS))
+        cache_key = f"{key_prefix}_result"
+        if st.button("✨ Generate AI changelog", key=f"{key_prefix}_go", width="stretch"):
+            with st.spinner(f"Asking {provider} to summarize the diff…"):
+                try:
+                    prompt = build_compare_changelog_prompt(drift, added, removed, structure, b_name, model)
+                    st.session_state[cache_key] = call_llm(prompt)
+                except LLMError as exc:
+                    st.error(str(exc))
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Unexpected error calling {provider}: {exc}")
+        text = st.session_state.get(cache_key)
+        if text:
+            st.markdown(text)
+
+
+def _cs_verbatim(value: str) -> str:
+    """C# verbatim string literal (@"...") - handles multi-line DAX cleanly;
+    the only character that needs escaping is an embedded double-quote,
+    doubled rather than backslash-escaped."""
+    return '@"' + str(value).replace('"', '""') + '"'
+
+
+def build_dax_apply_csharp(items: List[Dict[str, str]]) -> str:
+    """items: [{"object_kind": "measure"|"calculated column", "table", "name", "dax"}, ...]"""
+    lines: List[str] = [
+        "// =====================================================================",
+        "// Generated by VPAX Semantic Model Explorer - AI DAX Assistant",
+        "// Applies ONLY the AI-suggested rewrites accepted below.",
+        "//",
+        "// HOW TO RUN",
+        "//   1. Open the model in Tabular Editor (2 or 3).",
+        "//   2. Advanced Scripting (C#) tab - paste this script, click Run (F5).",
+        "//   3. Review the diff Tabular Editor shows before saving.",
+        "//   4. Save changes back to the model (Ctrl+S, or File > Save to XMLA/PBIP).",
+        "//",
+        "// This DAX was AI-generated and has not been validated against your live",
+        "// data - review every expression below before running.",
+        "// =====================================================================",
+        "",
+    ]
+    for item in items:
+        collection = "Measures" if item["object_kind"] == "measure" else "Columns"
+        lines.append(
+            f'Model.Tables[{_cs_string(item["table"])}].{collection}[{_cs_string(item["name"])}]'
+            f'.Expression = {_cs_verbatim(item["dax"])};'
+        )
+    lines.append("")
+    lines.append(f"// {len(items)} object(s) updated.")
+    return "\n".join(lines)
+
+
+def render_apply_dax_script(
+    df: pd.DataFrame, name_col: str, object_kind: str, ai_key_prefix: str, apply_key_prefix: str,
+) -> None:
+    """Lets the user pick which AI-suggested DAX rewrites to accept, then
+    download a Tabular Editor C# script that applies just those.
+
+    This app has no safe way to write DAX directly into a .pbix - the
+    compiled semantic model inside is a proprietary Analysis Services binary,
+    not JSON or text, and only the real Tabular Object Model engine (what
+    Tabular Editor runs on) can edit it correctly. Patching the bytes from
+    here risks silently producing a file Power BI Desktop can't open. This
+    is the safe equivalent: same one-click feel, but the actual write
+    happens inside a tool built to do it.
+    """
+    results: Dict[str, Any] = st.session_state.get(f"{ai_key_prefix}_batch_results", {})
+    candidates = {
+        name: r for name, r in results.items()
+        if not r.get("error") and str(r.get("revised_dax") or "").strip()
+    }
+    if not candidates:
+        return
+
+    with st.expander("Apply accepted suggestions — download a Tabular Editor script",
+                      icon=":material/rocket_launch:", expanded=False):
+        st.caption(
+            "This app can't safely write DAX directly into a .pbix — its compiled semantic "
+            "model is a proprietary binary that only Tabular Editor's engine can edit correctly; "
+            "patching it here risks corrupting the file. Pick which AI suggestions below you "
+            "accept, and download a ready-to-run script that applies exactly those changes in "
+            "Tabular Editor instead."
+        )
+        options = list(candidates.keys())
+        picked = st.multiselect(
+            f"{object_kind.capitalize()}s to apply", options, default=options,
+            key=f"{apply_key_prefix}_pick",
+        )
+        if not picked:
+            st.info("Select at least one accepted suggestion to generate a script.")
+            return
+
+        items = []
+        for name in picked:
+            row = df[df[name_col].astype(str) == name]
+            if row.empty:
+                continue
+            table = str(row.iloc[0].get("TableName") or "")
+            items.append({
+                "object_kind": object_kind, "table": table, "name": name,
+                "dax": candidates[name]["revised_dax"],
+            })
+        script = build_dax_apply_csharp(items)
+        preview = script if len(script) <= 2000 else script[:2000] + "\n// … (truncated preview, full script downloads below)"
+        st.code(preview, language="csharp")
+        st.download_button(
+            f"⬇ Download apply script ({len(items)} change{'s' if len(items) != 1 else ''})",
+            script.encode("utf-8"),
+            file_name=f"apply_ai_dax_{_slug(object_kind)}.csx", mime="text/plain",
+            key=f"{apply_key_prefix}_dl", width="stretch",
+        )
 
 
 def render_ai_dax_assistant(
@@ -6307,6 +7021,9 @@ if nav_page == "Measures":
             meas_view_df = render_ai_dax_assistant(
                 "measure", meas_df, "MeasureName", "MeasureExpression", model, key_prefix="ai_meas"
             )
+            render_apply_dax_script(
+                meas_df, "MeasureName", "measure", ai_key_prefix="ai_meas", apply_key_prefix="apply_meas"
+            )
             search = st.text_input("Search measure name or expression…", key="measure_search")
             view = meas_view_df
             if search:
@@ -6333,6 +7050,9 @@ if nav_page == "Calculated Columns":
         else:
             cols_view_df = render_ai_dax_assistant(
                 "calculated column", cols_df, "ColumnName", "ColumnExpression", model, key_prefix="ai_calc"
+            )
+            render_apply_dax_script(
+                cols_df, "ColumnName", "calculated column", ai_key_prefix="ai_calc", apply_key_prefix="apply_calc"
             )
             show_table(cols_view_df.reset_index(drop=True), "Calculated Columns", height=460, key="calccols", row_height=130)
 
@@ -6460,6 +7180,7 @@ if nav_page == "Unused Objects":
             if view.empty:
                 st.success("Every column is referenced somewhere in the model.", icon="✅")
             else:
+                view = render_ai_unused_risk(view, model, key_prefix="ai_unused")
                 show_table(view, "Unused Columns", height=460, key="unused")
                 if has_report:
                     rescued = int((disposition_df["Verdict"] == "Keep — used on report visuals only").sum())
@@ -6588,7 +7309,11 @@ if nav_page == "Model Health":
         if health_df.empty:
             st.success("No health-check findings for this model.", icon="✅")
         else:
-            counts = health_df["Severity"].value_counts()
+            health_view_df = render_ai_grouped_fixes(
+                health_df, model, key_prefix="ai_health",
+                group_col="Rule", object_col="Object", message_col="Message", group_label="rule",
+            )
+            counts = health_view_df["Severity"].value_counts()
             c1, c2, c3 = st.columns(3)
             c1.metric("🔴 High", int(counts.get("High", 0)), help="Likely wrong or a real performance risk — worth fixing.")
             c2.metric("🟠 Medium", int(counts.get("Medium", 0)), help="A design choice worth double-checking.")
@@ -6597,7 +7322,7 @@ if nav_page == "Model Health":
                 "Show high severity only", value=bool(counts.get("High", 0) > 12),
                 key="health_only_high",
             )
-            view = health_df[health_df["Severity"] == "High"] if only_high else health_df
+            view = health_view_df[health_view_df["Severity"] == "High"] if only_high else health_view_df
             show_table(sort_by_severity(view), "Model Health", height=460, key="health", row_height=120)
             st.caption(
                 "Mechanical fixes for several of these — hiding join keys, dropping unused "
@@ -6678,6 +7403,8 @@ if nav_page == "Data Dictionary Export":
             "measure-dependency diagrams render client-side only; download them separately from "
             "their own tabs."
         )
+        ai_descriptions_df = render_ai_descriptions(model, key_prefix="ai_desc")
+
         if EXCEL_ENGINE is None:
             st.button(
                 "⬇ Download Data Dictionary (.xlsx)", disabled=True, width="stretch",
@@ -6686,20 +7413,22 @@ if nav_page == "Data Dictionary Export":
         else:
             # Reused from the single centralised scan, so the workbook can
             # never disagree with what the audit sections are showing.
+            extra_sheets = [
+                ("Compression Advice", encoding_df),
+                ("Fabric Readiness", fabric_df),
+                ("Taxonomy Issues", taxonomy_issues),
+                ("RLS Exposure", rls_summary_df),
+                ("Near-Duplicate Measures", duplicates_df.drop(columns=["DAX A", "DAX B"],
+                                                               errors="ignore")),
+                ("Field Parameters", field_params_df),
+                ("Broken Visuals", broken_df),
+                ("Column Disposition", disposition_df),
+                ("Source Lineage", build_sql_lineage(model)),
+            ]
+            if not ai_descriptions_df.empty:
+                extra_sheets.append(("AI-Drafted Descriptions", ai_descriptions_df))
             excel_bytes = build_data_dictionary_excel(
-                model, health_df, naming_df, unused_df,
-                extra_sheets=[
-                    ("Compression Advice", encoding_df),
-                    ("Fabric Readiness", fabric_df),
-                    ("Taxonomy Issues", taxonomy_issues),
-                    ("RLS Exposure", rls_summary_df),
-                    ("Near-Duplicate Measures", duplicates_df.drop(columns=["DAX A", "DAX B"],
-                                                                   errors="ignore")),
-                    ("Field Parameters", field_params_df),
-                    ("Broken Visuals", broken_df),
-                    ("Column Disposition", disposition_df),
-                    ("Source Lineage", build_sql_lineage(model)),
-                ],
+                model, health_df, naming_df, unused_df, extra_sheets=extra_sheets,
             )
             st.download_button(
                 "⬇ Download Data Dictionary (.xlsx)", excel_bytes,
@@ -6850,7 +7579,13 @@ if nav_page == "Compression Advisor":
             c1.metric("🔴 High", counts.get("High", 0), help="Large, clearly fixable waste.")
             c2.metric("🟠 Medium", counts.get("Medium", 0))
             c3.metric("Columns advised", len(encoding_df))
-            show_table(encoding_df, "Compression Advice", height=440, key="encoding", row_height=130)
+            encoding_ai_df = encoding_df.copy()
+            encoding_ai_df["Object"] = encoding_ai_df["Table"] + "[" + encoding_ai_df["Column"] + "]"
+            encoding_view_df = render_ai_grouped_fixes(
+                encoding_ai_df, model, key_prefix="ai_compression",
+                group_col="Table", object_col="Object", message_col="Why", group_label="table",
+            ).drop(columns=["Object"])
+            show_table(encoding_view_df, "Compression Advice", height=440, key="encoding", row_height=130)
             with st.expander("How to act on these", icon=":material/build:"):
                 st.markdown(
                     "- **HASH on a numeric column** — set `EncodingHint = Value` in Tabular "
@@ -6891,7 +7626,13 @@ if nav_page == "Fabric Readiness":
             st.warning("No hard blockers, but some items need attention before migrating.", icon="🟠")
         else:
             st.success("No Direct Lake blockers detected in this export.", icon="✅")
-        show_table(fabric_df, "Fabric Readiness", height=420, key="fabric", row_height=130)
+        fabric_view_df = fabric_df
+        if not fabric_df.empty:
+            fabric_view_df = render_ai_grouped_fixes(
+                fabric_df, model, key_prefix="ai_fabric",
+                group_col="Check", object_col="Object", message_col="Finding", group_label="check",
+            )
+        show_table(fabric_view_df, "Fabric Readiness", height=420, key="fabric", row_height=130)
         st.info(
             "**What this can't see:** whether the source Delta tables are V-Order optimised, "
             "the size and count of Parquet row groups, or the capacity SKU you're targeting. "
@@ -6929,6 +7670,10 @@ if nav_page == "Model Compare":
             k[1].metric("Missing", len(removed), help="In the baseline, absent here.")
             k[2].metric("Extra", len(added), help="Local measures not in the certified set.")
             k[3].metric("Structure changes", len(diff["structure"]))
+
+            render_ai_compare_changelog(
+                drift, added, removed, diff["structure"], b_name, model, key_prefix="ai_compare",
+            )
 
             if drift.empty and added.empty and removed.empty:
                 st.success("Every measure matches the baseline, name and DAX.", icon="✅")
@@ -6993,9 +7738,15 @@ if nav_page == "RLS Simulator":
             st.markdown("#### Per-role verdict")
             show_table(rls_summary_df, "RLS Summary", height=240, key="rls_summary", row_height=90)
 
-            roles_list = sorted(rls_sim_df["Role"].dropna().unique().tolist())
+            rls_sim_view_df = render_ai_grouped_fixes(
+                rls_sim_df, model, key_prefix="ai_rls",
+                group_col="Role", object_col="Table", message_col="Path / Reason", group_label="role",
+                out_col="AI How to Fix (role-specific)",
+            )
+
+            roles_list = sorted(rls_sim_view_df["Role"].dropna().unique().tolist())
             picked_role = st.selectbox("Trace filter propagation for", roles_list, key="rls_role")
-            trace = rls_sim_df[rls_sim_df["Role"] == picked_role]
+            trace = rls_sim_view_df[rls_sim_view_df["Role"] == picked_role]
             only_problems = st.checkbox(
                 "Show only unsecured related tables", value=True, key="rls_only_problems",
                 help="Tables with no relationship path to the secured table are expected to be "
@@ -7103,7 +7854,12 @@ if nav_page == "Report Usage":
                     "These visuals will error or render blank when someone opens the page.",
                     icon="🔴",
                 )
-                show_table(broken_df, "Broken Visuals", height=320, key="broken_visuals", row_height=110)
+                broken_view_df = render_ai_grouped_fixes(
+                    broken_df, model, key_prefix="ai_broken",
+                    group_col="Table", object_col="Field", message_col="Problem", group_label="table",
+                    out_col="AI Likely Cause",
+                )
+                show_table(broken_view_df, "Broken Visuals", height=320, key="broken_visuals", row_height=110)
 
             st.markdown("#### Delete safety per column")
             hide_kept = st.checkbox("Show only columns safe to delete", value=True, key="disp_only_safe")
@@ -7151,9 +7907,11 @@ if nav_page == "Duplicate Measures":
             c1.metric("🔴 Very close (95%+)", counts.get("High", 0))
             c2.metric("🟠 Similar", counts.get("Medium", 0))
             c3.metric("Pairs found", len(dupes))
+            dupes_view = render_ai_duplicate_judgments(dupes, model, key_prefix="ai_dupes")
+            show_cols = ["Measure A", "Table A", "Measure B", "Table B", "Similarity %", "Severity", "Verdict"]
+            show_cols += [c for c in ("AI Recommendation", "AI Reasoning") if c in dupes_view.columns]
             show_table(
-                dupes[["Measure A", "Table A", "Measure B", "Table B", "Similarity %",
-                       "Severity", "Verdict"]],
+                dupes_view[show_cols],
                 "Near-Duplicate Measures", height=340, key="dupes", row_height=100,
             )
             labels = [f"{r['Measure A']}  ↔  {r['Measure B']}  ({r['Similarity %']}%)"
