@@ -113,6 +113,8 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
+from twbx_convert import render_twbx_conversion_page
+
 # --------------------------------------------------------------------------
 # Guard against being launched the wrong way
 # --------------------------------------------------------------------------
@@ -4953,9 +4955,31 @@ def show_table(
 # .vpax or Model.bim, so the result is something to review and copy into
 # Tabular Editor or Power BI Desktop yourself - never applied automatically.
 
-LLM_PROVIDERS: Dict[str, Dict[str, str]] = {
-    "OpenAI (ChatGPT)": {"default_model": "gpt-4o-mini"},
-    "Anthropic (Claude)": {"default_model": "claude-3-5-sonnet-20241022"},
+# Model lists are curated, not fetched live - verified against each
+# provider's own docs. First entry in "models" is the pre-selected default
+# (picked for low cost / good-enough quality, matching this app's use case:
+# short, well-defined DAX/insight generations, not long agentic sessions).
+LLM_PROVIDERS: Dict[str, Dict[str, object]] = {
+    "OpenAI (ChatGPT)": {
+        "models": ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6", "gpt-4o-mini", "gpt-4o"],
+        "key_placeholder": "sk-…",
+    },
+    "Anthropic (Claude)": {
+        "models": ["claude-sonnet-5", "claude-opus-5", "claude-haiku-4-5", "claude-fable-5"],
+        "key_placeholder": "sk-ant-…",
+    },
+    "DeepSeek": {
+        "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
+        "key_placeholder": "sk-…",
+    },
+    "Llama (via Groq)": {
+        "models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+        "key_placeholder": "gsk_…",
+    },
+    "Google (Gemini)": {
+        "models": ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.1-pro-preview"],
+        "key_placeholder": "AIza…",
+    },
 }
 
 
@@ -5127,9 +5151,12 @@ def _http_post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any], 
         raise LLMError("The request timed out - the model may be under heavy load; try again.") from exc
 
 
-def call_openai(api_key: str, model_id: str, prompt: str) -> str:
+def call_openai_compatible(base_url: str, api_key: str, model_id: str, prompt: str, provider_label: str) -> str:
+    """Shared dispatch for any provider that speaks the OpenAI Chat
+    Completions wire format - OpenAI itself, plus DeepSeek and Groq (Llama),
+    which both implement the same API shape."""
     result = _http_post_json(
-        "https://api.openai.com/v1/chat/completions",
+        base_url,
         {"Authorization": f"Bearer {api_key}"},
         {
             "model": model_id,
@@ -5141,7 +5168,21 @@ def call_openai(api_key: str, model_id: str, prompt: str) -> str:
     try:
         return result["choices"][0]["message"]["content"]
     except (KeyError, IndexError) as exc:
-        raise LLMError(f"Unexpected response shape from OpenAI: {result}") from exc
+        raise LLMError(f"Unexpected response shape from {provider_label}: {result}") from exc
+
+
+def call_openai(api_key: str, model_id: str, prompt: str) -> str:
+    return call_openai_compatible("https://api.openai.com/v1/chat/completions", api_key, model_id, prompt, "OpenAI")
+
+
+def call_deepseek(api_key: str, model_id: str, prompt: str) -> str:
+    return call_openai_compatible("https://api.deepseek.com/chat/completions", api_key, model_id, prompt, "DeepSeek")
+
+
+def call_llama_groq(api_key: str, model_id: str, prompt: str) -> str:
+    return call_openai_compatible(
+        "https://api.groq.com/openai/v1/chat/completions", api_key, model_id, prompt, "Groq"
+    )
 
 
 def call_anthropic(api_key: str, model_id: str, prompt: str) -> str:
@@ -5156,8 +5197,37 @@ def call_anthropic(api_key: str, model_id: str, prompt: str) -> str:
         raise LLMError(f"Unexpected response shape from Anthropic: {result}") from exc
 
 
+def call_gemini(api_key: str, model_id: str, prompt: str) -> str:
+    import urllib.parse
+
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{urllib.parse.quote(model_id)}:generateContent?key={urllib.parse.quote(api_key)}"
+    )
+    result = _http_post_json(
+        url, {},
+        {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
+        },
+    )
+    try:
+        return result["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError) as exc:
+        raise LLMError(f"Unexpected response shape from Gemini: {result}") from exc
+
+
 def _llm_ready() -> bool:
     return bool(st.session_state.get("llm_api_key", "").strip())
+
+
+_LLM_DISPATCH: Dict[str, Any] = {
+    "OpenAI (ChatGPT)": call_openai,
+    "Anthropic (Claude)": call_anthropic,
+    "DeepSeek": call_deepseek,
+    "Llama (via Groq)": call_llama_groq,
+    "Google (Gemini)": call_gemini,
+}
 
 
 def call_llm(prompt: str) -> str:
@@ -5168,10 +5238,9 @@ def call_llm(prompt: str) -> str:
     api_key = st.session_state.get("llm_api_key", "").strip()
     if not api_key:
         raise LLMError("No API key configured — set one in the sidebar's AI assistant section.")
-    model_id = st.session_state.get("llm_model_id_active", "").strip() or LLM_PROVIDERS[provider]["default_model"]
-    if provider == "OpenAI (ChatGPT)":
-        return call_openai(api_key, model_id, prompt)
-    return call_anthropic(api_key, model_id, prompt)
+    model_id = st.session_state.get("llm_model_id_active", "").strip() or LLM_PROVIDERS[provider]["models"][0]
+    fn = _LLM_DISPATCH.get(provider, call_openai)
+    return fn(api_key, model_id, prompt)
 
 
 def _parse_llm_json(raw: str) -> Dict[str, Any]:
@@ -5934,6 +6003,190 @@ def render_apply_dax_script(
         )
 
 
+def build_source_description_prompt(table: str, sql: str, model: Dict[str, Any]) -> str:
+    schema = _compact_schema_summary(model, max_tables=10, max_cols_per_table=6)
+    return f"""You are a data analyst documenting where a semantic model's tables come from. Given the
+SQL that loads table "{table}", write a short, plain-English description of what this data source
+represents in business terms — what real-world entity or event it captures — based only on the SQL
+(table/column names, joins, filters) and the schema context. Never invent business meaning that
+isn't evidenced by the SQL itself.
+
+SQL:
+{sql}
+
+Model schema (abbreviated, for context only):
+{schema}
+
+Respond with ONLY a single JSON object (no markdown fences, no commentary outside the JSON):
+{{"description": "two or three sentences"}}"""
+
+
+def get_ai_source_description(table: str, sql: str, model: Dict[str, Any]) -> str:
+    parsed = _parse_llm_json(call_llm(build_source_description_prompt(table, sql, model)))
+    return str(parsed.get("description") or "").strip()
+
+
+def render_ai_source_descriptions(pq_df: pd.DataFrame, model: Dict[str, Any], key_prefix: str) -> pd.DataFrame:
+    """One LLM call per table with an embedded SQL query, describing what
+    that source represents in business terms - the kind of context a .vpax/
+    .pbix carries nothing about, since it only knows the query, not why it
+    exists."""
+    batch_key = f"{key_prefix}_batch_results"
+    sql_len = pq_df["SQL"].fillna("").astype(str).str.len() if "SQL" in pq_df.columns else pd.Series(dtype=int)
+    with_sql = pq_df[sql_len > 0]
+
+    with st.expander("AI-generated data source descriptions",
+                      icon=":material/smart_toy:", expanded=False):
+        st.caption(
+            "For each table whose Power Query step embeds a SQL query, sends that SQL to the "
+            "provider configured in the sidebar and asks for a plain-English description of what "
+            "the source represents — useful for onboarding or a data catalog, since a .vpax/.pbix "
+            "carries the query itself but nothing about why it exists."
+        )
+        if not _llm_ready():
+            st.info(
+                "Set an OpenAI or Claude API key in the sidebar's **AI assistant** section to "
+                "use this.", icon=":material/key:",
+            )
+            return pq_df
+        if with_sql.empty:
+            st.info("No table in this model has an embedded SQL query to describe.")
+            return pq_df
+
+        tables = sorted(with_sql["TableName"].dropna().unique().tolist())
+        cache: Dict[str, Any] = st.session_state.get(batch_key, {})
+        done, total = len(cache), len(tables)
+        provider = st.session_state.get("llm_provider") or next(iter(LLM_PROVIDERS))
+
+        m1, m2 = st.columns(2)
+        m1.metric("Tables described", f"{done} / {total}")
+        m2.metric("Errors", sum(1 for r in cache.values() if r.get("error")))
+
+        confirm = st.checkbox(
+            f"I understand this makes {total - done} API call(s) to {provider}",
+            key=f"{key_prefix}_confirm", value=False,
+        ) if done < total else True
+        c1, c2 = st.columns([3, 1])
+        go_label = f"✨ Describe all {total} sources" if done == 0 else f"✨ Describe remaining {total - done}"
+        go = c1.button(go_label, key=f"{key_prefix}_go", width="stretch", disabled=(done >= total) or not confirm)
+        if cache and c2.button("Clear", key=f"{key_prefix}_clear", width="stretch"):
+            st.session_state[batch_key] = {}
+            st.rerun()
+
+        if go:
+            remaining = [t for t in tables if t not in cache]
+            progress = st.progress(0.0)
+            status = st.empty()
+            for i, table in enumerate(remaining):
+                status.caption(f"Asking {provider} about “{table}”… ({i + 1}/{len(remaining)})")
+                sql = str(with_sql[with_sql["TableName"] == table]["SQL"].iloc[0])
+                try:
+                    cache[table] = {"description": get_ai_source_description(table, sql, model), "error": None}
+                except LLMError as exc:
+                    cache[table] = {"description": "", "error": str(exc)}
+                except Exception as exc:  # noqa: BLE001
+                    cache[table] = {"description": "", "error": f"Unexpected error: {exc}"}
+                st.session_state[batch_key] = dict(cache)
+                progress.progress((i + 1) / max(len(remaining), 1))
+            status.empty()
+            progress.empty()
+            st.rerun()
+
+    if not cache:
+        return pq_df
+
+    def _desc(table: str) -> str:
+        r = cache.get(table)
+        return "" if not r or r.get("error") else r.get("description", "")
+
+    out = pq_df.copy()
+    out["AI Source Description"] = out["TableName"].map(_desc)
+    return out
+
+
+def build_page_summary_prompt(page_name: str, report: Dict[str, Any], model: Dict[str, Any]) -> str:
+    bindings = report["bindings"]
+    page_bindings = bindings[bindings["Page"] == page_name] if not bindings.empty else bindings
+
+    visuals: List[str] = []
+    if not page_bindings.empty and "Visual" in page_bindings.columns:
+        for visual_id, grp in page_bindings.groupby("Visual"):
+            vtype = str(grp["Visual Type"].iloc[0]) if "Visual Type" in grp.columns and not grp.empty else ""
+            fields = sorted({f"{r['Table']}[{r['Field']}]" for _, r in grp.iterrows() if r.get("Field")})
+            if fields:
+                visuals.append(f"- {vtype or 'visual'}: {', '.join(fields[:10])}")
+    visuals_text = "\n".join(visuals[:25]) if visuals else "(no visual bindings read for this page)"
+
+    tables = tables_used_by_page(page_name, report, model)
+    page_fields = set(page_bindings["Field"].dropna().astype(str)) if not page_bindings.empty else set()
+    measures_df = model["measures"]
+    used_measures = measures_df[measures_df["MeasureName"].isin(page_fields)] if not measures_df.empty else measures_df
+    meas_text = "\n".join(
+        f"- {r['MeasureName']} = {r['MeasureExpression']}" for _, r in used_measures.head(20).iterrows()
+    ) or "(no measures identified on this page)"
+
+    pq_df = model["power_query"]
+    sql_bits = []
+    if not pq_df.empty and "SQL" in pq_df.columns:
+        for t in sorted(tables)[:10]:
+            rows = pq_df[(pq_df["TableName"] == t) & (pq_df["SQL"].fillna("").astype(str).str.len() > 0)]
+            if not rows.empty:
+                sql_bits.append(f"-- {t}\n{str(rows.iloc[0]['SQL'])[:400]}")
+    sql_text = "\n\n".join(sql_bits) if sql_bits else "(no source SQL available for these tables)"
+
+    return f"""You are a BI analyst writing a plain-English summary of a Power BI report page for a
+business audience — what it shows and what business questions it helps answer. Base this only on
+the visuals, measures, and source data listed below; never invent one that isn't listed.
+
+Page: {page_name}
+
+Visuals and the fields they show:
+{visuals_text}
+
+Measures used on this page:
+{meas_text}
+
+Tables involved: {", ".join(sorted(tables)) or "(none identified)"}
+
+Source SQL for those tables (abbreviated):
+{sql_text}
+
+Write a summary in markdown with exactly these two headings:
+### What this page shows
+One paragraph, plain business language — not a re-listing of every visual.
+
+### Key metrics
+A short bullet list of the most important measures on this page (at most 5) and what each one
+means in one sentence."""
+
+
+def render_ai_page_summary(page_name: str, report: Dict[str, Any], model: Dict[str, Any], key_prefix: str) -> None:
+    """A single LLM call summarizing one report page - the visuals, the DAX
+    behind them, and the source SQL behind that, all of which a .pbix+.vpax
+    pair together make available but nothing in the file itself narrates."""
+    with st.expander(f"AI summary — what “{page_name}” shows",
+                      icon=":material/smart_toy:", expanded=True):
+        if not _llm_ready():
+            st.info(
+                "Set an OpenAI or Claude API key in the sidebar's **AI assistant** section to "
+                "use this.", icon=":material/key:",
+            )
+            return
+        provider = st.session_state.get("llm_provider") or next(iter(LLM_PROVIDERS))
+        cache_key = f"{key_prefix}_{_slug(page_name)}"
+        if st.button("✨ Generate page summary", key=f"{cache_key}_go", width="stretch"):
+            with st.spinner(f"Asking {provider} to summarize “{page_name}”…"):
+                try:
+                    st.session_state[cache_key] = call_llm(build_page_summary_prompt(page_name, report, model))
+                except LLMError as exc:
+                    st.error(str(exc))
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Unexpected error calling {provider}: {exc}")
+        text = st.session_state.get(cache_key)
+        if text:
+            st.markdown(text)
+
+
 def render_ai_dax_assistant(
     object_kind: str, df: pd.DataFrame, name_col: str, expr_col: str, model: Dict[str, Any], key_prefix: str
 ) -> pd.DataFrame:
@@ -6138,17 +6391,27 @@ with st.sidebar:
         llm_provider = st.selectbox("Provider", list(LLM_PROVIDERS), key="llm_provider")
         st.text_input(
             "API key", type="password", key="llm_api_key",
-            placeholder="sk-…" if llm_provider.startswith("OpenAI") else "sk-ant-…",
+            placeholder=LLM_PROVIDERS[llm_provider].get("key_placeholder", "sk-…"),
         )
         # Keyed per-provider so switching providers doesn't leave the other
-        # provider's model id sitting in the box; mirrored into a
+        # provider's model choice sitting in the box; mirrored into a
         # provider-agnostic key so downstream code has one stable place to
         # read the active model id from regardless of which provider is set.
-        llm_model_id = st.text_input(
-            "Model", value=LLM_PROVIDERS[llm_provider]["default_model"],
-            key=f"llm_model_id_{llm_provider}",
-            help="Override with a specific model version if you need one other than the default.",
+        _model_options = LLM_PROVIDERS[llm_provider]["models"]
+        _custom_choice = "✏️ Custom (type a model ID)…"
+        llm_model_choice = st.selectbox(
+            "Model", _model_options + [_custom_choice],
+            key=f"llm_model_choice_{llm_provider}",
+            help="Curated from each provider's current model lineup. Pick "
+                 "Custom to type any other model ID (e.g. a newer release).",
         )
+        if llm_model_choice == _custom_choice:
+            llm_model_id = st.text_input(
+                "Custom model ID", key=f"llm_model_id_custom_{llm_provider}",
+                placeholder=_model_options[0],
+            ).strip() or _model_options[0]
+        else:
+            llm_model_id = llm_model_choice
         st.session_state["llm_model_id_active"] = llm_model_id
 
 # A real upload always wins over the sample, so the sample never sticks
@@ -6361,7 +6624,7 @@ NAV_GROUPS: Dict[str, List[str]] = {
         "Security & Perspectives", "RLS Simulator", "Fix Script (C#)", "Model Cleanup",
         "Data Dictionary Export", "Theme",
     ],
-    "🧱 Migrate": ["Databricks Lakeview Export"],
+    "🧱 Migrate": ["Databricks Lakeview Export", "TWBX → Power BI"],
 }
 
 # Which finding set backs each page, so the scorecard and the sidebar badges
@@ -6448,6 +6711,13 @@ nav_group = st.segmented_control(
     default=group_options[0] if "nav_group" not in st.session_state else None,
     width="stretch",
 )
+if nav_group not in NAV_GROUPS:
+    # Guards against a stale/mismatched widget-state value surviving a
+    # hot-reload (e.g. `required=True` doesn't always stop segmented_control
+    # from resolving to None when the session's cached selection can't be
+    # reconciled with the current run) - fall back to the first group rather
+    # than crashing the whole page on a KeyError.
+    nav_group = group_options[0]
 
 _pages = NAV_GROUPS[nav_group]
 if st.session_state.get("nav_page") not in _pages:
@@ -6461,6 +6731,8 @@ if len(_pages) > 1:
         default=_pages[0] if "nav_page" not in st.session_state else None,
         width="stretch",
     )
+    if nav_page not in _pages:
+        nav_page = _pages[0]
 else:
     nav_page = _pages[0]
 
@@ -6686,6 +6958,10 @@ if nav_page == "Dashboard Screens":
                 view[["Screen / Page Name", "Visuals"]].reset_index(drop=True),
                 "Report Pages", height=360, key="pages",
             )
+            page_names = sorted(view["Screen / Page Name"].dropna().astype(str).tolist())
+            if page_names:
+                picked_page = st.selectbox("Summarize a page", page_names, key="page_summary_pick")
+                render_ai_page_summary(picked_page, report, model, key_prefix="ai_page_summary")
         elif screens_df.empty:
             st.info(
                 "No measure groups were found in this model, so report pages cannot be inferred. "
@@ -7088,17 +7364,22 @@ if nav_page == "Power Query (SQL)":
             sql_len = pq_df["SQL"].fillna("").astype(str).str.len()
             with_sql = pq_df[sql_len > 0]
             st.caption(f"{len(with_sql)} of {len(pq_df)} partitions embed a SQL query.")
+            pq_view_df = render_ai_source_descriptions(pq_df, model, key_prefix="ai_source_desc")
+            source_desc_cache: Dict[str, Any] = st.session_state.get("ai_source_desc_batch_results", {})
             choice = st.selectbox(
                 "View the full SQL for a table",
                 ["(all — summary table)"]
                 + sorted(with_sql["TableName"].dropna().unique().tolist(), key=str),
             )
             if choice.startswith("(all"):
-                show_table(pq_df.reset_index(drop=True), "Power Query SQL", height=460, key="pq", row_height=140)
+                show_table(pq_view_df.reset_index(drop=True), "Power Query SQL", height=460, key="pq", row_height=140)
             else:
                 matches = with_sql.loc[with_sql["TableName"] == choice, "SQL"]
                 sql = str(matches.iloc[0]) if not matches.empty else ""
                 st.code(sql or "-- no SQL found for this table", language="sql")
+                desc_result = source_desc_cache.get(choice)
+                if desc_result and not desc_result.get("error") and desc_result.get("description"):
+                    st.info(desc_result["description"], icon=":material/smart_toy:")
                 if sql:
                     sources = _sql_sources(sql)
                     if sources:
@@ -7447,58 +7728,85 @@ if nav_page == "Theme":
             "titles/headers/labels/callouts) and lets you download it as-is, so it can be "
             "re-imported into another report via **View ➜ Themes ➜ Browse for themes**."
         )
-        if report is None:
-            st.info("👈 Upload the matching **.pbix** in the sidebar (*Add report pages*) to read its theme.")
-        else:
+
+        uploaded_theme_file = st.file_uploader(
+            "Upload a theme.json instead — optional", type=["json"], key="theme_upload",
+            help="Use this if the theme read from your .pbix above looks wrong or came back "
+                 "empty, or to preview/re-download a theme from a different, known-good report "
+                 "without re-uploading that whole .pbix.",
+        )
+
+        theme: Optional[Dict[str, Any]] = None
+        if uploaded_theme_file is not None:
+            raw = uploaded_theme_file.getvalue()
+            try:
+                tj = json.loads(raw.decode("utf-8-sig"))
+                if not isinstance(tj, dict):
+                    raise ValueError("Top-level JSON must be an object.")
+                theme = {
+                    "found": True, "is_custom": True, "raw_bytes": raw, "json": tj,
+                    "name": tj.get("name") or _slug(uploaded_theme_file.name.rsplit(".", 1)[0], "theme"),
+                }
+                st.success(f"Using the uploaded theme file instead of the .pbix's own theme.", icon="✅")
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+                st.error(f"That file isn't valid theme JSON: {exc}")
+        elif report is not None:
             theme = report.get("theme") or {"found": False}
-            if not theme.get("found"):
-                name = theme.get("name")
-                if name:
-                    st.warning(
-                        f"This report references a theme named **{name}**, but its JSON file "
-                        "couldn't be located inside the .pbix."
-                    )
-                else:
-                    st.info(
-                        "No explicit theme override found — this report uses Power BI's built-in "
-                        "default theme, which isn't stored as a file inside the .pbix."
-                    )
-            else:
-                tj = theme["json"]
-                kind = "custom theme uploaded into this report" if theme["is_custom"] else "built-in Power BI theme"
-                st.markdown(f"**{theme['name']}** — {kind}")
 
-                data_colors = tj.get("dataColors") or []
-                if data_colors:
-                    swatches = "".join(
-                        f'<span style="display:inline-block;width:22px;height:22px;'
-                        f'background:{html.escape(str(c))};border:1px solid #cbd5e1;'
-                        f'border-radius:4px;margin:2px" title="{html.escape(str(c))}"></span>'
-                        for c in data_colors
-                    )
-                    st.markdown(swatches, unsafe_allow_html=True)
-
-                info_cols = st.columns(3)
-                info_cols[0].metric("Background", tj.get("background", "—"))
-                info_cols[1].metric("Foreground (text)", tj.get("foreground", "—"))
-                info_cols[2].metric("Table/visual accent", tj.get("tableAccent", "—"))
-
-                text_classes = tj.get("textClasses") or {}
-                if text_classes:
-                    st.markdown("**Text styles**")
-                    for role in ("header", "title", "label", "callout"):
-                        tc = text_classes.get(role)
-                        if isinstance(tc, dict):
-                            st.caption(
-                                f"**{role.capitalize()}** — {tc.get('fontFace', '—')}, "
-                                f"{tc.get('fontSize', '—')}pt, {tc.get('color', '—')}"
-                            )
-
-                st.download_button(
-                    "⬇ Download theme (.json)", theme["raw_bytes"],
-                    file_name=f"{_slug(theme['name'], 'theme')}.json",
-                    mime="application/json", key="dl_theme", width="stretch",
+        if theme is None:
+            st.info(
+                "👈 Upload the matching **.pbix** in the sidebar (*Add report pages*) to read its "
+                "theme, or upload a **theme.json** file directly above."
+            )
+        elif not theme.get("found"):
+            name = theme.get("name")
+            if name:
+                st.warning(
+                    f"This report references a theme named **{name}**, but its JSON file "
+                    "couldn't be located inside the .pbix. Try uploading the theme.json directly "
+                    "above if you have it."
                 )
+            else:
+                st.info(
+                    "No explicit theme override found — this report uses Power BI's built-in "
+                    "default theme, which isn't stored as a file inside the .pbix."
+                )
+        else:
+            tj = theme["json"]
+            kind = "custom theme uploaded into this report" if theme["is_custom"] else "built-in Power BI theme"
+            st.markdown(f"**{theme['name']}** — {kind}")
+
+            data_colors = tj.get("dataColors") or []
+            if data_colors:
+                swatches = "".join(
+                    f'<span style="display:inline-block;width:22px;height:22px;'
+                    f'background:{html.escape(str(c))};border:1px solid #cbd5e1;'
+                    f'border-radius:4px;margin:2px" title="{html.escape(str(c))}"></span>'
+                    for c in data_colors
+                )
+                st.markdown(swatches, unsafe_allow_html=True)
+
+            info_cols = st.columns(3)
+            info_cols[0].metric("Background", tj.get("background", "—"))
+            info_cols[1].metric("Foreground (text)", tj.get("foreground", "—"))
+            info_cols[2].metric("Table/visual accent", tj.get("tableAccent", "—"))
+
+            text_classes = tj.get("textClasses") or {}
+            if text_classes:
+                st.markdown("**Text styles**")
+                for role in ("header", "title", "label", "callout"):
+                    tc = text_classes.get(role)
+                    if isinstance(tc, dict):
+                        st.caption(
+                            f"**{role.capitalize()}** — {tc.get('fontFace', '—')}, "
+                            f"{tc.get('fontSize', '—')}pt, {tc.get('color', '—')}"
+                        )
+
+            st.download_button(
+                "⬇ Download theme (.json)", theme["raw_bytes"],
+                file_name=f"{_slug(theme['name'], 'theme')}.json",
+                mime="application/json", key="dl_theme", width="stretch",
+            )
 
 # --- Display Folders ----------------------------------------------------------
 if nav_page == "Display Folders":
@@ -8262,6 +8570,22 @@ if nav_page == "Databricks Lakeview Export":
                 "actually registered in Unity Catalog before importing.",
                 icon="ℹ️",
             )
+
+if nav_page == "TWBX → Power BI":
+    with tab_guard("TWBX → Power BI"):
+        _twbx_lineage_guess = build_sql_lineage(model)
+        _twbx_default_catalog, _twbx_default_schema = "workspace", "default"
+        if not _twbx_lineage_guess.empty:
+            _db_mode = _twbx_lineage_guess["Database"].mode()
+            _sch_mode = _twbx_lineage_guess["Schema"].mode()
+            if len(_db_mode) and _db_mode.iloc[0]:
+                _twbx_default_catalog = _db_mode.iloc[0]
+            if len(_sch_mode) and _sch_mode.iloc[0]:
+                _twbx_default_schema = _sch_mode.iloc[0]
+        render_twbx_conversion_page(
+            default_catalog=_twbx_default_catalog, default_schema=_twbx_default_schema,
+            call_llm=call_llm if _llm_ready() else None, llm_ready=_llm_ready(),
+        )
 
 st.markdown(
     f'<div class="app-footer">🧩 VPAX Semantic Model Explorer &nbsp;·&nbsp; <b>{AUTHOR}</b></div>',
